@@ -1,0 +1,9 @@
+# build output
+/build/
+bin/
+obj/
+*.user
+.vs/
+
+# downloaded / built by scripts\setup-deps.cmd (IPP, mozjpeg, Little CMS)
+/third_party/

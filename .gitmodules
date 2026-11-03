@@ -1,0 +1,3 @@
+[submodule "external/psd_sdk"]
+	path = external/psd_sdk
+	url = https://github.com/pig1800/psd_sdk.git

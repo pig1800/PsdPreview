@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>PsdPreview</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- Built by scripts\build-native.cmd -->
+    <NativeBinDir>$(MSBuildThisFileDirectory)..\..\build\native\bin\</NativeBinDir>
+  </PropertyGroup>
+
+  <!-- psdpreview_native.dll + the two NPP runtime DLLs it delay-loads; flows to referencing projects. -->
+  <ItemGroup>
+    <None Include="$(NativeBinDir)psdpreview_native.dll;$(NativeBinDir)nppc64_*.dll;$(NativeBinDir)nppig64_*.dll"
+          Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+  <Target Name="CheckNativeBuilt" BeforeTargets="Build">
+    <Error Condition="!Exists('$(NativeBinDir)psdpreview_native.dll')"
+           Text="psdpreview_native.dll not found in $(NativeBinDir). Run scripts\build-native.cmd first." />
+  </Target>
+
+</Project>
