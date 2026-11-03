@@ -1,12 +1,12 @@
 // Demo / smoke test:
-//   PsdPreview.Demo <dir-or-file>... [--width 720] [--cpu] [--out DIR] [--limit N] [--quality 82] [--validate-only] [--skip-validate]
+//   PsdPreview.Demo <dir-or-file>... [--width 720] [--cpu] [--out DIR] [--limit N] [--quality 82] [--max-compression] [--extract N] [--encode N] [--validate-only] [--skip-validate]
 using System.Diagnostics;
 using PsdPreview;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 var inputs = new List<string>();
-int width = 720, limit = int.MaxValue, quality = 82;
-bool forceCpu = false, validateOnly = false, skipValidate = false;
+int width = 720, limit = int.MaxValue, quality = 82, extract = 0, encode = 0;
+bool forceCpu = false, validateOnly = false, skipValidate = false, maxCompression = false;
 string? outDir = null;
 for (int i = 0; i < args.Length; i++)
 {
@@ -17,6 +17,9 @@ for (int i = 0; i < args.Length; i++)
         case "--quality": quality = int.Parse(args[++i]); break;
         case "--out": outDir = args[++i]; break;
         case "--cpu": forceCpu = true; break;
+        case "--max-compression": maxCompression = true; break;
+        case "--extract": extract = int.Parse(args[++i]); break;
+        case "--encode": encode = int.Parse(args[++i]); break;
         case "--validate-only": validateOnly = true; break;
         case "--skip-validate": skipValidate = true; break;
         default: inputs.Add(args[i]); break;
@@ -24,7 +27,7 @@ for (int i = 0; i < args.Length; i++)
 }
 if (inputs.Count == 0)
 {
-    Console.WriteLine("usage: PsdPreview.Demo <dir-or-file>... [--width N] [--cpu] [--out DIR] [--limit N] [--quality Q] [--validate-only]");
+    Console.WriteLine("usage: PsdPreview.Demo <dir-or-file>... [--width N] [--cpu] [--out DIR] [--limit N] [--quality Q] [--max-compression] [--validate-only]");
     return 1;
 }
 
@@ -55,7 +58,8 @@ if (validateOnly) return 0;
 
 var bad = problems.Select(p => p.Index).ToHashSet();
 var good = files.Where((_, i) => !bad.Contains(i)).ToList();
-var options = new PsdPreviewOptions { ForceCpu = forceCpu, JpegQuality = quality };
+var options = new PsdPreviewOptions { ForceCpu = forceCpu, JpegQuality = quality, MaxCompression = maxCompression,
+                                     ExtractThreads = extract, EncodeThreads = encode };
 
 var mem = PsdPreviewer.CheckMemory(good, width, options);
 Console.WriteLine($"Memory: {mem}  -> {(mem.IsEnough ? "OK" : "NOT ENOUGH")}");

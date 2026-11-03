@@ -108,6 +108,11 @@ public sealed class PsdPreviewOptions
     public int EncodeThreads { get; init; }
     /// <summary>Max files decoded but not yet encoded (bounds peak memory). Default 2 x cores.</summary>
     public int MaxInFlight { get; init; }
+    /// <summary>
+    /// mozjpeg's max-compression profile (trellis quantisation + progressive scan search): ~11%
+    /// smaller files, but ~5x slower encoding, which is the pipeline's bottleneck. Off by default.
+    /// </summary>
+    public bool MaxCompression { get; init; }
 }
 
 /// <summary>

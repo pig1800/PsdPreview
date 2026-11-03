@@ -2,10 +2,13 @@
 // psdpreview_tests sdk <psd/psb>...  patched psd_sdk ParseImageDataSection vs. our decoder (pixel-exact),
 //                                    then truncated / corrupted in-memory copies must fail cleanly
 // psdpreview_tests bench <psd/psb>.. decode speed per SIMD level
+// psdpreview_tests rle               our PackBits decoder vs. psd_sdk's on random, also malformed, rows
 #include <chrono>
 #include <cstdio>
 #include <random>
 
+#include "PsdPch.h"
+#include "PsdDecompressRle.h"
 #include "psd.h"
 #include "simd.h"
 #include "simd_kernels.h"
@@ -222,12 +225,59 @@ static int bench(int argc, wchar_t** argv) {
     return 0;
 }
 
+// Random rows: mostly valid PackBits of random runs (sometimes ending early, overrunning the row
+// or with 0x80 no-ops), plus pure noise. Output and result must equal psd_sdk's DecompressRle.
+static void test_rle() {
+    std::mt19937 rng(7);
+    std::vector<uint8_t> src, a, b;
+    size_t mismatches = 0, malformed = 0, runs = 0;
+    for (int iter = 0; iter < 200000; ++iter) {
+        const size_t size = 1 + rng() % 600;
+        src.clear();
+        if (iter % 10 == 9) {
+            const size_t n = rng() % 700;
+            for (size_t i = 0; i < n; ++i) src.push_back(uint8_t(rng()));
+        } else {
+            size_t out = 0;
+            const size_t target = size + (rng() % 4 == 0 ? rng() % 200 : 0) - (rng() % 8 == 0 ? std::min<size_t>(size, rng() % 50) : 0);
+            while (out < target) {
+                const uint32_t kind = rng() % 9;
+                if (kind == 0) { src.push_back(0x80); continue; }
+                const size_t n = 1 + rng() % (kind < 4 ? 128 : 127);
+                if (kind < 4) {  // literal
+                    src.push_back(uint8_t(n - 1));
+                    for (size_t i = 0; i < n; ++i) src.push_back(uint8_t(rng()));
+                    out += n;
+                } else {  // repeat of n + 1 >= 2
+                    src.push_back(uint8_t(257 - (n + 1)));
+                    src.push_back(uint8_t(rng()));
+                    out += n + 1;
+                }
+                ++runs;
+            }
+            if (rng() % 16 == 0 && !src.empty()) src.resize(rng() % src.size());  // cut short
+        }
+        const size_t srcSize = src.size();
+        src.resize(srcSize + kRleSlack);
+        a.assign(size + kRleSlack, 0xCD);
+        b.assign(size + kRleSlack, 0xCD);
+        const bool okSdk = psd::imageUtil::DecompressRle(src.data(), srcSize, a.data(), size);
+        const bool okOurs = unpack_row(src.data(), srcSize, b.data(), size);
+        malformed += !okSdk;
+        if (okSdk != okOurs || memcmp(a.data(), b.data(), size) != 0) ++mismatches;
+    }
+    CHECK(mismatches == 0, L"%zu of 200000 rows differ from psd_sdk's DecompressRle", mismatches);
+    wprintf(L"rle: 200000 rows (%zu runs, %zu malformed rows), %zu mismatches: %s\n", runs, malformed, mismatches,
+            mismatches ? L"FAIL" : L"PASS");
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && !wcscmp(argv[1], L"simd")) test_simd();
+    else if (argc >= 2 && !wcscmp(argv[1], L"rle")) test_rle();
     else if (argc >= 3 && !wcscmp(argv[1], L"sdk")) test_sdk(argc - 2, argv + 2);
     else if (argc >= 3 && !wcscmp(argv[1], L"bench")) bench(argc - 2, argv + 2);
     else {
-        wprintf(L"usage: psdpreview_tests simd | sdk <files> | bench <files>\n");
+        wprintf(L"usage: psdpreview_tests simd | rle | sdk <files> | bench <files>\n");
         return 2;
     }
     return g_failures ? 1 : 0;

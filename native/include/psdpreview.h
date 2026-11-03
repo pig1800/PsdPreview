@@ -83,6 +83,8 @@ typedef struct PP_Options {
     int32_t extractThreads; /* default: logical cores (on the GPU path: one CUDA stream each) */
     int32_t encodeThreads;  /* default: logical cores */
     int32_t maxInFlight;    /* files decoded but not yet encoded; default 2 x cores */
+    int32_t maxCompression; /* non-zero: mozjpeg max compression (trellis, scan search): ~11% smaller
+                               files, ~5x slower encoding (the pipeline's bottleneck) */
 } PP_Options;
 
 typedef struct PP_Issue {
@@ -105,8 +107,8 @@ typedef struct PP_MemoryReport {
 /* Timings are thread-seconds summed over a stage's threads (diagnostics). */
 typedef struct PP_BatchInfo {
     double elapsedSeconds;
-    double decodeSeconds;      /* composite decode (GPU path: incl. streaming the bands up) */
-    double resizeSeconds;      /* IPP resize, or GPU tail upload + resize + download */
+    double decodeSeconds;      /* composite decode (GPU path: reading + uploading the still compressed data) */
+    double resizeSeconds;      /* IPP resize, or GPU unpack + resize + download */
     double encodeSeconds;      /* colour conversion + JPEG encoding */
     double extractWaitSeconds; /* extract threads blocked by maxInFlight: encoding is the bottleneck */
     double encodeIdleSeconds;  /* encode threads waiting for work: decoding/resizing is the bottleneck */

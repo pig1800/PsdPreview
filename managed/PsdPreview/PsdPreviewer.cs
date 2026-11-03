@@ -168,6 +168,7 @@ public static unsafe class PsdPreviewer
             ExtractThreads = o.ExtractThreads,
             EncodeThreads = o.EncodeThreads,
             MaxInFlight = o.MaxInFlight,
+            MaxCompression = o.MaxCompression ? 1 : 0,
         };
 
     private static void Check(int status, string operation)

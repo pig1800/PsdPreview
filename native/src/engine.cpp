@@ -2,9 +2,11 @@
 //
 // One fixed Slot per input file. Two thread groups, each fires as soon as its input is ready:
 //   extract (N threads) decode the composite and resize it:
-//     GPU: rows go straight into pinned band buffers of the thread's GpuStreamer; each band is
-//          uploaded on the thread's own CUDA stream while the next one is decoded, our CUDA kernel
-//          resizes as soon as the last band is queued, the result is downloaded (push -> process -> pull)
+//     GPU: the composite's still PackBits-compressed colour channels are read straight into
+//          pinned band buffers of the thread's GpuStreamer; each band is uploaded on the thread's
+//          own CUDA stream while the next one is read; then our CUDA kernels unpack the rows and
+//          resize, and the result is downloaded (push -> process -> pull). Formats the kernels
+//          don't take (32-bit, raw 16-bit) go the CPU way.
 //     CPU: decode into a reused per-thread buffer, resize with IPP (same filter, resize_filter.h)
 //   encode  (N threads) embedded profile -> sRGB (lcms2, on the small image), mozjpeg
 // Extract hands slot indices to encode through an IndexQueue. A counting semaphore caps how
@@ -77,6 +79,7 @@ namespace {
 
 struct Config {
     int extract, encode, inFlight, quality;
+    bool maxCompression;
     bool gpu;
 };
 
@@ -88,6 +91,7 @@ Config resolve(const PP_Options* o, int count) {
     c.encode = std::clamp(pick(o ? o->encodeThreads : 0, n), 1, maxThreads);
     c.inFlight = std::max(1, pick(o ? o->maxInFlight : 0, 2 * n));
     c.quality = (o && o->jpegQuality >= 1 && o->jpegQuality <= 100) ? o->jpegQuality : 82;
+    c.maxCompression = o && o->maxCompression;
     c.gpu = gpu_ready() && !(o && o->forceCpu);
     return c;
 }
@@ -173,7 +177,7 @@ struct Plan {
 Plan plan_memory(const std::vector<Slot>& slots, const Config& c) {
     Plan p;
     std::vector<uint64_t> resized;
-    uint64_t maxSrc = 0, maxScratch = 0, maxEncode = 0, results = 0, maxSrcDev = 0, maxDstDev = 0;
+    uint64_t maxSrc = 0, maxScratch = 0, maxEncode = 0, results = 0, maxSrcCpuOnly = 0, maxDev = 0;
     for (const Slot& s : slots) {
         if (s.code) continue;
         resized.push_back(uint64_t(s.dw) * s.dh * kPixelBytes);
@@ -181,8 +185,8 @@ Plan plan_memory(const std::vector<Slot>& slots, const Config& c) {
         maxScratch = std::max(maxScratch, decode_scratch_bytes(s.hdr));
         maxEncode = std::max(maxEncode, jpeg_working_bytes(s.dw, s.dh));
         results += jpeg_estimated_bytes(s.dw, s.dh);
-        maxSrcDev = std::max(maxSrcDev, gpu_pitch(uint64_t(s.hdr.width) * kPixelBytes) * s.hdr.height);
-        maxDstDev = std::max(maxDstDev, gpu_pitch(uint64_t(s.dw) * kPixelBytes) * s.dh);
+        if (GpuStreamer::supports(s.hdr)) maxDev = std::max(maxDev, GpuStreamer::device_bytes(s.hdr, s.dw, s.dh));
+        else maxSrcCpuOnly = std::max(maxSrcCpuOnly, s.hdr.decodedBytes());
     }
     // Worst case: the largest `inFlight` resized images are all waiting for the encoders.
     std::sort(resized.begin(), resized.end(), std::greater<>());
@@ -192,9 +196,10 @@ Plan plan_memory(const std::vector<Slot>& slots, const Config& c) {
     const uint64_t encoders = uint64_t(std::min<int>(c.encode, int(resized.size())));
     p.host = inFlight + extractors * maxScratch + encoders * maxEncode + results + (64ull << 20);
     if (c.gpu && extractors) {
-        // decoded rows only pass through two pinned bands per thread; images live in VRAM
-        p.host += extractors * 2 * kGpuBandBytes;
-        p.device = extractors * (maxSrcDev + maxDstDev) + (64ull << 20);
+        // compressed data only passes through two pinned bands per thread; images live in VRAM
+        // (formats the GPU path doesn't take are decoded on the CPU, into a per-thread buffer)
+        p.host += extractors * (2 * kGpuBandBytes + maxSrcCpuOnly);
+        p.device = extractors * maxDev + (64ull << 20);
     } else {
         p.host += extractors * maxSrc;  // one reused whole-image decode buffer per thread
     }
@@ -262,23 +267,21 @@ std::unique_ptr<PP_Batch> run_batch(const wchar_t* const* paths, int count, int 
                 s.resized = pool.take(size_t(s.dw) * s.dh * kPixelBytes);
 
                 bool resized = false;
-                if (gs) {
+                if (gs && GpuStreamer::supports(s.hdr)) {
                     std::wstring gerr;
-                    if (gs->begin(s.hdr.width, s.hdr.height, gerr)) {
-                        FileStatus st;
-                        {
-                            Timed t(stats.decode);
-                            st = decode_composite(f, s.hdr, *gs);  // bands stream to the GPU while decoding
-                        }
-                        if (!st.ok()) {
-                            gs->abort();
-                            fail(s, st.code, st.message, 3);
-                            continue;
-                        }
+                    FileStatus st;
+                    bool uploaded;
+                    {
+                        Timed t(stats.decode);
+                        uploaded = gs->upload(f, s.hdr, st, gerr);  // compressed data streams to the GPU
+                    }
+                    if (!st.ok()) { fail(s, st.code, st.message, 3); continue; }
+                    if (uploaded) {
                         progress.step();
                         extracted = true;
                         Timed t(stats.resize);
-                        resized = gs->finish(s.dw, s.dh, s.resized.data(), gerr);
+                        resized = gs->finish(s.dw, s.dh, s.resized.data(), st, gerr);  // unpack + resize on the GPU
+                        if (!st.ok()) { fail(s, st.code, st.message, 2); continue; }
                     }
                     if (!resized) {  // e.g. out of GPU memory: redo this one on the CPU
                         ++stats.gpuFallbacks;
@@ -330,7 +333,7 @@ std::unique_ptr<PP_Batch> run_batch(const wchar_t* const* paths, int count, int 
             try {
                 Timed t(stats.encode);
                 to_srgb(s.color, s.hdr.colorMode, s.resized.data(), size_t(s.dw) * s.dh);
-                ok = encode_jpeg(s.resized.data(), s.dw, s.dh, cfg.quality, s.jpeg, err);
+                ok = encode_jpeg(s.resized.data(), s.dw, s.dh, cfg.quality, cfg.maxCompression, s.jpeg, err);
             } catch (const std::bad_alloc&) {
                 code = PP_FILE_OUT_OF_MEMORY;
                 err = L"out of memory while encoding";
@@ -355,7 +358,8 @@ std::unique_ptr<PP_Batch> run_batch(const wchar_t* const* paths, int count, int 
                                            gpu_description(), cfg.extract, kGpuBandBytes >> 20)
                              : std::format(L"Intel IPP {} antialiased bicubic, {} dispatch{}", cpu.version, cpu.target,
                                            cpu.avx512Active ? L" (AVX-512)" : L"");
-    batch->backend += std::format(L"; {} extract / {} encode threads; mozjpeg q{}", cfg.extract, cfg.encode, cfg.quality);
+    batch->backend += std::format(L"; {} extract / {} encode threads; mozjpeg q{}{}", cfg.extract, cfg.encode, cfg.quality,
+                                  cfg.maxCompression ? L" max compression" : L"");
     if (!gpuNote.empty())
         batch->backend += std::format(L"; GPU problem ({} image(s) redone on the CPU): {}", stats.gpuFallbacks.load(), gpuNote);
     batch->elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

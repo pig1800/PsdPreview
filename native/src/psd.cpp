@@ -1,17 +1,16 @@
 // PSD/PSB composite reader.
 //
 // psd_sdk provides the document structure (CreateDocument: header + section offsets,
-// PSD/PSB aware) and the bounds-checked PackBits decoder (imageUtil::DecompressRle).
-// The composite is not read with psd_sdk's ParseImageDataSection because that decodes
-// every channel (incl. alpha) into full planes; here only the colour channels are read,
-// a band of rows at a time, and merged straight into 4-byte pixels with SIMD.
+// PSD/PSB aware). The composite is not read with psd_sdk's ParseImageDataSection because
+// that decodes every channel (incl. alpha) into full planes; here only the colour channels
+// are read, a band of rows at a time, PackBits-decoded (unpack_row) and merged straight into
+// 4-byte pixels with SIMD.
 #include "psd.h"
 
 #include "simd.h"
 
 // psd_sdk headers expect its precompiled header first.
 #include "PsdPch.h"
-#include "PsdDecompressRle.h"
 #include "PsdDocument.h"
 #include "PsdFile.h"
 #include "PsdMallocAllocator.h"
@@ -65,6 +64,7 @@ const wchar_t* color_mode_name(int m) {
 constexpr uint16_t kIccProfileResource = 0x040F;
 constexpr uint16_t kVersionInfoResource = 0x0421;
 constexpr uint64_t kBandBytes = 4ull << 20;  // compressed bytes read per band (all channels)
+
 
 bool is_resource_signature(const uint8_t* s) {
     return !memcmp(s, "8BIM", 4) || !memcmp(s, "MeSa", 4) || !memcmp(s, "AgHg", 4) || !memcmp(s, "PHUT", 4) ||
@@ -148,6 +148,45 @@ void float32_to_8(uint8_t* row, uint32_t n) {
 
 }  // namespace
 
+// See psd.h: each run is copied in fixed 32-byte chunks (plain vector moves) instead of a
+// memcpy/memset call per run of at most 128 bytes.
+bool unpack_row(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t size) {
+    const uint8_t* const srcEnd = src + srcSize;
+    uint8_t* const dstEnd = dst + size;
+    while (dst < dstEnd && src < srcEnd) {
+        const uint8_t b = *src++;
+        if (b == 0x80) continue;  // no-op
+        const size_t left = size_t(dstEnd - dst);
+        if (b < 0x80) {  // literal: the next b + 1 bytes
+            const size_t n = size_t(b) + 1;
+            if (n > size_t(srcEnd - src)) break;
+            if (n <= left) {
+                for (size_t i = 0; i < n; i += 32) std::memcpy(dst + i, src + i, 32);
+                dst += n;
+            } else {
+                std::memcpy(dst, src, left);
+                dst = dstEnd;
+            }
+            src += n;
+        } else {  // repeat: the next byte 257 - b times
+            if (src == srcEnd) break;
+            const size_t n = 257 - size_t(b);
+            uint8_t v[32];
+            std::memset(v, *src++, sizeof v);
+            if (n <= left) {
+                for (size_t i = 0; i < n; i += 32) std::memcpy(dst + i, v, 32);
+                dst += n;
+            } else {
+                std::memset(dst, v[0], left);
+                dst = dstEnd;
+            }
+        }
+    }
+    if (dst == dstEnd) return true;
+    std::memset(dst, 0, size_t(dstEnd - dst));
+    return false;
+}
+
 FileStatus read_psd_header(const FileReader& f, PsdHeader& h) {
     h = {};
     h.fileSize = f.size();
@@ -204,6 +243,7 @@ FileStatus read_psd_header(const FileReader& f, PsdHeader& h) {
     if (!f.read_exact(image.offset, comp, 2)) return {PP_FILE_TRUNCATED, L"file ends before the composite"};
     h.compression = be16(comp);
     h.imageDataPos = image.offset + 2;
+    h.imageDataBytes = image.length - 2;
     if (h.compression == 2 || h.compression == 3)
         return {PP_FILE_UNSUPPORTED_COMPRESSION, L"ZIP-compressed composite is not supported"};
     if (h.compression != 0 && h.compression != 1)
@@ -254,13 +294,27 @@ uint64_t decode_scratch_bytes(const PsdHeader& h) {
     const uint64_t rb = h.rowBytes(), need = uint64_t(h.sourceChannels());
     if (h.compression == 0) return need * std::max<uint64_t>(rb, kBandBytes / need + rb);
     const uint64_t counts = need * h.height * (rle_count_bytes(h) + 4);
-    return need * rb + kBandBytes + need * (2 * rb + 16) + counts;
+    return need * (rb + kRleSlack) + kBandBytes + need * (2 * rb + 16 + kRleSlack) + counts;
 }
 
 bool read_icc_profile(const FileReader& f, const PsdHeader& h, std::vector<uint8_t>& icc) {
     if (h.iccSize == 0) return false;
     icc.resize(h.iccSize);
     return f.read_exact(h.iccPos, icc.data(), icc.size());
+}
+
+FileStatus read_rle_layout(const FileReader& f, const PsdHeader& h, RleLayout& out) {
+    FileStatus st = read_rle_counts(f, h, out.counts);
+    if (!st.ok()) return st;
+    if (h.mergedFlag == -1 && rle_is_blank(h, out.counts))
+        return {PP_FILE_BLANK_COMPOSITE, L"composite is blank (written without a real flattened image)"};
+    out.dataPos = h.imageDataPos + uint64_t(h.channels) * h.height * rle_count_bytes(h);
+    out.dataBytes = 0;
+    for (uint32_t c : out.counts) out.dataBytes += c;
+    if (out.dataPos + out.dataBytes > h.fileSize)
+        return {PP_FILE_TRUNCATED, std::format(L"file truncated inside the composite: needs {} bytes, file is {} bytes",
+                                               out.dataPos + out.dataBytes, h.fileSize)};
+    return {};
 }
 
 FileStatus decode_composite(const FileReader& f, const PsdHeader& h, Bytes& out) {
@@ -317,16 +371,16 @@ FileStatus decode_composite(const FileReader& f, const PsdHeader& h, RowSink& si
 
     // RLE: per band of rows, read each channel's compressed bytes (contiguous within
     // the channel), unpack row by row, narrow, merge.
-    std::vector<uint32_t> counts;
-    FileStatus st = read_rle_counts(f, h, counts);
+    RleLayout lay;
+    FileStatus st = read_rle_layout(f, h, lay);
     if (!st.ok()) return st;
-    if (h.mergedFlag == -1 && rle_is_blank(h, counts))
-        return {PP_FILE_BLANK_COMPOSITE, L"composite is blank (written without a real flattened image)"};
+    const std::vector<uint32_t>& counts = lay.counts;
 
-    Bytes rowBuf(size_t(need) * rb);
-    for (int c = 0; c < need; ++c) rows[c] = rowBuf.data() + uint64_t(c) * rb;
+    const size_t rowStride = size_t(rb) + kRleSlack;
+    Bytes rowBuf(size_t(need) * rowStride);
+    for (int c = 0; c < need; ++c) rows[c] = rowBuf.data() + c * rowStride;
     uint64_t cursor[4] = {};  // file offset of each channel's next unread row
-    uint64_t pos = h.imageDataPos + uint64_t(h.channels) * H * rle_count_bytes(h);
+    uint64_t pos = lay.dataPos;
     for (int c = 0; c < need; ++c) {
         cursor[c] = pos;
         for (uint32_t y = 0; y < H; ++y) pos += counts[uint64_t(c) * H + y];
@@ -345,7 +399,7 @@ FileStatus decode_composite(const FileReader& f, const PsdHeader& h, RowSink& si
 
         const uint8_t* src[4] = {};
         for (int c = 0; c < need; ++c) {
-            band[c].resize(len[c]);
+            band[c].resize(len[c] + kRleSlack);
             if (!f.read_exact(cursor[c], band[c].data(), len[c]))
                 return {PP_FILE_TRUNCATED, std::format(L"file truncated inside composite channel {}", c)};
             cursor[c] += len[c];
@@ -354,7 +408,7 @@ FileStatus decode_composite(const FileReader& f, const PsdHeader& h, RowSink& si
         for (; y < y1; ++y) {
             for (int c = 0; c < need; ++c) {
                 const uint32_t n = counts[uint64_t(c) * H + y];
-                if (!psd::imageUtil::DecompressRle(src[c], n, rows[c], rb))
+                if (!unpack_row(src[c], n, rows[c], rb))
                     return {PP_FILE_CORRUPT, std::format(L"corrupt RLE data in composite channel {} row {}", c, y)};
                 src[c] += n;
                 to8(rows[c]);

@@ -3,7 +3,8 @@
 Extracts the flattened full-resolution composite stored in PSD/PSB files, resizes it to a
 target width (antialiased bicubic fitted to Photoshop's *Bicubic Sharper* — on CUDA when
 available, Intel IPP with AVX-512 otherwise), converts
-embedded colour profiles to sRGB (Little CMS 2), and encodes JPEG with mozjpeg (q82).
+embedded colour profiles to sRGB (Little CMS 2), and encodes JPEG with mozjpeg (q82). On the
+GPU path the composite is also decoded on the GPU.
 Native C++ DLL with a C# (.NET 8) wrapper.
 
 ## Build
@@ -23,8 +24,8 @@ static libs from NuGet, builds mozjpeg 4.1.5, fetches Little CMS 2.20 source int
 Requirements: Git, VS 2026 C++ tools, CMake ≥ 3.24, NASM, CUDA Toolkit 13 (headers/libs only —
 no nvcc needed), .NET 8 SDK.
 
-The CUDA kernel (`native\src\gpu_resize.cu`) is checked in compiled, as `gpu_resize.ptx`, which
-CMake embeds into the DLL. After editing the kernel, run `scripts\build-ptx.cmd`: it needs nvcc
+The CUDA kernels (`native\src\gpu_kernels.cu`) are checked in compiled, as `gpu_kernels.ptx`, which
+CMake embeds into the DLL. After editing them, run `scripts\build-ptx.cmd`: it needs nvcc
 and VS 2019 or 2022 C++ tools (e.g. VS 2019 Build Tools) as nvcc's host compiler, because
 CUDA 13.0 can't use VS 2026's (its STL requires CUDA 13.2+).
 
@@ -32,8 +33,8 @@ CUDA 13.0 can't use VS 2026's (its STL requires CUDA 13.2+).
 
 `psdpreview_native.dll` is the only file: IPP, mozjpeg, lcms2, psd_sdk and cudart are linked
 statically against the static CRT (`/MT`), so it imports only Windows system DLLs (`KERNEL32`,
-the `api-ms-win-core-synch` API set) — no VC++ redistributable, no CUDA DLLs. The GPU resize is
-our own kernel, shipped as PTX that the driver JIT-compiles for the installed GPU on first use
+the `api-ms-win-core-synch` API set) — no VC++ redistributable, no CUDA DLLs. The GPU code is
+our own kernels, shipped as PTX that the driver JIT-compiles for the installed GPU on first use
 (Turing / sm_75 or newer, driver for CUDA 13+). Without an NVIDIA driver or GPU, everything
 works on the CPU path.
 
@@ -82,12 +83,16 @@ Console.WriteLine(batch.Backend);                 // what actually ran
 
 `PsdPreviewOptions` (all optional): `JpegQuality` (82), `ForceCpu`, `ExtractThreads` (default:
 logical cores; on the GPU path one CUDA stream each), `EncodeThreads` (default: logical cores),
-`MaxInFlight` (default 2 × cores). `batch.Stats` reports thread-seconds per stage (decode, resize,
-encode, extract threads waiting for encoders, encoders idle) and GPU fallbacks.
+`MaxInFlight` (default 2 × cores), `MaxCompression` (mozjpeg's max-compression profile: ~11%
+smaller files, ~3.5× slower overall, see [Encode](#pipeline)). `batch.Stats` reports
+thread-seconds per stage (decode, resize, encode, extract threads waiting for encoders, encoders
+idle) and GPU fallbacks; on the GPU path "decode" is reading + uploading the compressed data and
+"resize" is the GPU's unpack + resize + download.
 `PsdPreviewer.GetCpuBackend()` reports the SIMD level and IPP dispatch.
 
 `samples\PsdPreview.Demo` is a runnable end-to-end example:
-`PsdPreview.Demo <dir-or-files> [--width 720] [--cpu] [--out DIR] [--limit N] [--validate-only] [--skip-validate]`.
+`PsdPreview.Demo <dir-or-files> [--width 720] [--cpu] [--out DIR] [--limit N] [--quality 82] [--max-compression]
+[--extract N] [--encode N] [--validate-only] [--skip-validate]`.
 
 The C ABI is in `native\include\psdpreview.h` (blittable structs, UTF-16 paths).
 
@@ -125,26 +130,42 @@ colour channels are read — layers, masks, alpha channels and other metadata ar
 One fixed slot per input file. Extract threads decode **and** resize; encode threads take
 each image as soon as it is resized:
 
-1. **Decode** (each extract thread): per band of rows (~4 MB of compressed data), read each
-   colour channel's bytes, PackBits-decode row by row (psd_sdk's `DecompressRle`), reduce >8-bit
-   samples, and merge the planes into 4-byte pixels with SIMD: RGBA8888 (A = 255; gray expanded)
-   or CMYK. Also reads the ICC profile and looks up its transform.
-2. **Resize** to the target width (height keeps aspect ratio), 4 channels, with the filter
-   described [below](#resize-filter):
-   - GPU — streamed push/process/pull per extract thread: each thread has its own non-blocking
-     CUDA stream and two 4 MB pinned band buffers. The decoder writes rows straight into the
-     current band; a full band is uploaded asynchronously (`cudaMemcpy2DAsync` + event) while the
-     next band is decoded into the other buffer. As soon as the last band is queued, the resize
-     kernel (`gpu_resize.cu`) runs on the same stream and the result is downloaded into the
-     encoder's buffer. The full-size image only ever exists in VRAM, allocated from a private
-     stream-ordered pool (`cudaMallocFromPoolAsync`), so the 16 streams' uploads and kernels
-     overlap with no host staging copies and no dispatcher thread. An image the GPU can't take
-     (e.g. VRAM exhausted) is redone on the CPU path.
-   - CPU: decode into a per-thread buffer that is reused across files, then
-     `ippiResizeAntialiasing_8u_C4R` (`ippiResizeCubic_8u_C4R` when enlarging).
-3. **Encode** (N threads): ICC → sRGB if needed, then mozjpeg reads the buffer as
-   `JCS_EXT_RGBX` with its default max-compression profile (progressive, trellis, optimised
-   Huffman, 4:2:0) at q82. Resized buffers are recycled through a small pool.
+1. **Decode and resize** (each extract thread), to the target width (height keeps aspect ratio),
+   4 channels, with the filter described [below](#resize-filter). Also reads the ICC profile and
+   looks up its transform.
+   - GPU (RLE 8/16-bit and raw 8-bit composites) — push/process/pull per extract thread, each
+     with its own non-blocking CUDA stream and two 4 MB pinned band buffers:
+     - push: the colour channels' data, still PackBits-compressed (~1.35 bytes/px for webtoon
+       pages instead of 4 decoded), is read from the file straight into the current band; a full
+       band is uploaded asynchronously while the next one is read into the other. The row
+       offsets (prefix sums of the RLE table) go up the same way. The CPU does nothing but read.
+     - process: `pp_unpack_rows` unpacks every row into 8-bit planes (one warp per row: the lanes
+       share each run header and copy the run together; 16-bit keeps the high byte; a corrupt row
+       is reported back as a `Corrupt` file), then `pp_resize_cubicN` resizes the planes.
+     - pull: the result comes back through the pinned bands into the encoder's buffer. (A direct
+       download into pageable memory is staged by the driver synchronously and stalled every
+       other thread's CUDA calls: 17 thread-s of the 25 the uploads took before.)
+
+     Waits use blocking-sync events, so waiting threads sleep instead of spinning. Device memory
+     comes from a private stream-ordered pool (`cudaMallocFromPoolAsync`), so the 16 streams
+     overlap freely. An image the GPU can't take (VRAM exhausted, 32-bit, raw 16-bit) goes the
+     CPU way.
+   - CPU: per band of rows (~4 MB of compressed data), read each colour channel's bytes,
+     PackBits-decode row by row (`unpack_row`), reduce >8-bit samples, and merge the planes into
+     4-byte pixels with SIMD: RGBA8888 (A = 255; gray expanded) or CMYK, into a per-thread buffer
+     reused across files; then `ippiResizeAntialiasing_8u_C4R` (`ippiResizeCubic_8u_C4R` when
+     enlarging). `unpack_row` has psd_sdk's `DecompressRle` semantics but copies each run in fixed
+     32-byte chunks (plain vector moves) instead of a `memcpy`/`memset` call per run of ≤ 128
+     bytes: 4× faster, and PackBits was ~90% of the decode time.
+2. **Encode** (N threads): ICC → sRGB if needed, then mozjpeg reads the buffer as
+   `JCS_EXT_RGBX`: progressive, optimised Huffman, 4:2:0, overshoot deringing, q82 — mozjpeg's
+   max-compression profile minus trellis quantisation and the progressive scan search. On 36 real
+   pages at q82 that is 5.2× faster to encode for 11% larger files, at better quality (SSIM 0.974
+   vs 0.972, PSNR 36.4 vs 34.4 dB, since trellis trades detail for size); the scan search alone
+   costs 1.5× for 0.4% and doesn't change a pixel. At equal file size trellis does look slightly
+   better (q78 without it: SSIM 0.969), hence `MaxCompression` for when size matters more.
+   Baseline instead of progressive would encode another 2× faster for 4% larger files (1.2
+   instead of 1.4 s for 200 pages at 425 px). Resized buffers are recycled through a small pool.
 
 A counting semaphore caps files "between decode start and encode end" (`MaxInFlight`), which
 bounds peak memory; `CheckMemory` computes the worst case from the actual headers using the
@@ -162,8 +183,11 @@ parameters were fitted to Photoshop's *Bicubic Sharper (reduction)*. Enlarging u
 (B = 0, C = 0.5), which interpolates, so a same-size resize changes nothing. `resize_filter.h`
 holds the parameters for both backends:
 
-- GPU: `gpu_resize.cu`, one thread per output pixel, computing both 1-D weight sets on the fly
-  (no tables, no intermediate image, so no VRAM beyond the source and result).
+- GPU: `pp_resize_cubicN` in `gpu_kernels.cu`, separable in one kernel: a 32 × 8 block streams
+  the source rows its output rows need through shared memory, filters each horizontally once,
+  then each thread sums its vertical taps from there. That reads ~3× less than a direct 2-D
+  gather (0.8 instead of 1.4 ms for 1280 × 19500 → 450) with identical results, and needs no
+  intermediate image or weight tables.
 - CPU: IPP's `ippiResizeAntialiasing` with the same cubic.
 
 The two backends agree to within rounding (luma PSNR 70 dB between their JPEGs).
@@ -210,7 +234,8 @@ Single-row (cache-resident, 1500 px) throughput on the 9800X3D:
 | AVX2 | 33.0 Gpx/s | 80 Gsamples/s |
 | AVX-512 | 39.7 Gpx/s | 95 Gsamples/s |
 
-Whole-file decode runs at ~750 Mpx/s per thread on every level — PackBits decoding dominates.
+Whole-file decode (CPU path) runs at ~1380 Mpx/s per thread on every level (~450 with psd_sdk's
+PackBits decoder); PackBits still dominates.
 
 ### IPP and AVX-512
 
@@ -246,6 +271,7 @@ scripts\vsenv.cmd cmake --build build/native --target psdpreview_tests
 build\native\bin\psdpreview_tests simd                # kernels at every level vs. scalar + throughput
 build\native\bin\psdpreview_tests sdk <psd/psb...>    # patched psd_sdk vs. our decoder; truncated/corrupt copies
 build\native\bin\psdpreview_tests bench <psd/psb...>  # decode speed per SIMD level
+build\native\bin\psdpreview_tests rle                 # unpack_row vs. psd_sdk's DecompressRle, 200000 random/malformed rows
 ```
 
 `tests\make_test_psd.py` writes minimal RGB/gray, 8/32-bit PSDs with an optional embedded ICC
@@ -255,14 +281,15 @@ profile (ImageMagick can't write 32-bit PSDs, and its grayscale + ICC PSDs are m
 
 200 real webtoon pages (1280 px wide, 26 GB of PSDs), warm file cache, two runs each:
 
-| target width | CPU (IPP) | GPU (CUDA, streamed) |
-|---|---|---|
-| 720 px | 13.5–13.7 s, peak RAM 4.9 GB | 13.4–13.5 s, peak RAM 2.8 GB |
-| 360 px | 5.7–5.9 s | 5.2–5.3 s |
+| target width | CPU (IPP) | GPU (CUDA) | JPEG total | before (either backend) |
+|---|---|---|---|---|
+| 720 px | 4.8–5.0 s, peak RAM 4.8 GB | 3.2–3.3 s, peak RAM 2.7 GB | 252 MiB | 13.4–13.7 s, 226 MiB |
+| 425 px | 3.2 s | 1.4 s | 113 MiB | 6.8 s, 102 MiB |
+| 360 px | 2.9–3.0 s | 1.2 s | 87 MiB | 5.2–5.9 s |
 
-Both paths are bound by the mozjpeg max-compression encode: the 16 encoders are busy for the
-whole run (~200 thread-s at 720 px) while extract threads mostly wait for them, and resizing
-is only ~15 thread-s on the CPU (~2 on the GPU). The antialiased filter costs about 1.7× the old
-non-antialiased cubic, which doesn't change the wall time. The GPU path's gain is therefore the
-resize time plus less memory traffic and ~40% less RAM; going substantially faster would need
-cheaper JPEG settings (e.g. without trellis quantisation / scan optimisation).
+`MaxCompression` at 720 px: 11.4 s (GPU) / 12.5 s (CPU), 226 MiB.
+
+On the GPU path the encoders are the bottleneck (~48 thread-s at 720 px, idle ~2 s) while the
+extract threads mostly wait for them: reading + uploading takes ~4.5 thread-s and the GPU work
+~4.5. On the CPU path decoding (~25 thread-s) and resizing (~30) compete with encoding for the
+cores.

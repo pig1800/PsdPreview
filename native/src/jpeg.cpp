@@ -50,7 +50,7 @@ void dest_term(j_compress_ptr cinfo) {
 
 }  // namespace
 
-bool encode_jpeg(const uint8_t* rgba, int w, int h, int quality, Bytes& out, std::wstring& error) {
+bool encode_jpeg(const uint8_t* rgba, int w, int h, int quality, bool maxCompression, Bytes& out, std::wstring& error) {
     if (w <= 0 || h <= 0 || w > PP_MAX_JPEG_DIMENSION || h > PP_MAX_JPEG_DIMENSION) {
         error = std::format(L"{}x{} exceeds the JPEG size limit", w, h);
         return false;
@@ -82,6 +82,15 @@ bool encode_jpeg(const uint8_t* rgba, int w, int h, int quality, Bytes& out, std
     cinfo.input_components = kPixelBytes;
     cinfo.in_color_space = JCS_EXT_RGBX;  // RGBA8888, alpha byte skipped
     jpeg_set_defaults(&cinfo);  // mozjpeg: JCP_MAX_COMPRESSION profile
+    if (!maxCompression) {
+        // The progressive scan search is ~1/3 of the max-compression encode time and trellis
+        // quantisation ~3/4 of the rest (see jpeg.h). The search only changes the scan layout
+        // (decoded pixels are identical).
+        jpeg_c_set_bool_param(&cinfo, JBOOLEAN_TRELLIS_QUANT, FALSE);
+        jpeg_c_set_bool_param(&cinfo, JBOOLEAN_TRELLIS_QUANT_DC, FALSE);
+        jpeg_c_set_bool_param(&cinfo, JBOOLEAN_OPTIMIZE_SCANS, FALSE);
+        jpeg_simple_progression(&cinfo);  // libjpeg's standard script instead of the search's candidates
+    }
     jpeg_set_quality(&cinfo, quality, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
 

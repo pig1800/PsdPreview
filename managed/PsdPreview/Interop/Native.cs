@@ -41,6 +41,7 @@ internal struct NativeOptions
     public int ExtractThreads;
     public int EncodeThreads;
     public int MaxInFlight;
+    public int MaxCompression;
 }
 
 [StructLayout(LayoutKind.Sequential)]
