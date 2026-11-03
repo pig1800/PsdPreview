@@ -38,7 +38,7 @@ var files = inputs.SelectMany<string, string>(p => Directory.Exists(p)
 var sw = Stopwatch.StartNew();
 var cuda = PsdPreviewer.InitializeCuda();
 Console.WriteLine(cuda.Success
-    ? $"CUDA: {cuda.DeviceName} sm_{cuda.ComputeCapability.Major}{cuda.ComputeCapability.Minor}, NPP {cuda.NppVersion}, " +
+    ? $"CUDA: {cuda.DeviceName} sm_{cuda.ComputeCapability.Major}{cuda.ComputeCapability.Minor}, " +
       $"{cuda.FreeMemoryBytes / 1048576} MiB free  (init {sw.ElapsedMilliseconds} ms)"
     : $"CUDA unavailable ({cuda.Status}: {cuda.Message}) - using CPU");
 var cpu = PsdPreviewer.GetCpuBackend();

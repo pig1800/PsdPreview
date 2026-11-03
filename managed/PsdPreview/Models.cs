@@ -7,7 +7,8 @@ public enum PsdPreviewStatus
     InvalidArgument = 1,
     CudaUnavailable = 2,
     CudaFailed = 3,
-    NppUnavailable = 4,
+    /// <summary>The GPU resize kernel failed to load (e.g. driver older than CUDA 13) or its self-test failed.</summary>
+    KernelUnavailable = 4,
     OutOfMemory = 5,
     Internal = 6,
 }
@@ -50,7 +51,6 @@ public sealed record CudaInitResult(
     Version ComputeCapability,
     long TotalMemoryBytes,
     long FreeMemoryBytes,
-    Version NppVersion,
     int CudaRuntimeVersion,
     int CudaDriverVersion)
 {

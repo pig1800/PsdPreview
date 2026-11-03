@@ -13,9 +13,9 @@
     <NativeBinDir>$(MSBuildThisFileDirectory)..\..\build\native\bin\</NativeBinDir>
   </PropertyGroup>
 
-  <!-- psdpreview_native.dll + the two NPP runtime DLLs it delay-loads; flows to referencing projects. -->
+  <!-- psdpreview_native.dll (standalone); flows to referencing projects. -->
   <ItemGroup>
-    <None Include="$(NativeBinDir)psdpreview_native.dll;$(NativeBinDir)nppc64_*.dll;$(NativeBinDir)nppig64_*.dll"
+    <None Include="$(NativeBinDir)psdpreview_native.dll"
           Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 

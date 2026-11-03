@@ -3,9 +3,9 @@
 // One fixed Slot per input file. Two thread groups, each fires as soon as its input is ready:
 //   extract (N threads) decode the composite and resize it:
 //     GPU: rows go straight into pinned band buffers of the thread's GpuStreamer; each band is
-//          uploaded on the thread's own CUDA stream while the next one is decoded, NPP resizes
-//          as soon as the last band is queued, the result is downloaded (push -> process -> pull)
-//     CPU: decode into a reused per-thread buffer, resize with IPP
+//          uploaded on the thread's own CUDA stream while the next one is decoded, our CUDA kernel
+//          resizes as soon as the last band is queued, the result is downloaded (push -> process -> pull)
+//     CPU: decode into a reused per-thread buffer, resize with IPP (same filter, resize_filter.h)
 //   encode  (N threads) embedded profile -> sRGB (lcms2, on the small image), mozjpeg
 // Extract hands slot indices to encode through an IndexQueue. A counting semaphore caps how
 // many files are between "decode started" and "encoded", which bounds peak memory and makes
@@ -351,9 +351,9 @@ std::unique_ptr<PP_Batch> run_batch(const wchar_t* const* paths, int count, int 
     progress.finish();
 
     batch->usedGpu = cfg.gpu;
-    batch->backend = cfg.gpu ? std::format(L"CUDA NPP bicubic on {}, streamed ({} streams, 2x{} MB pinned bands each)",
+    batch->backend = cfg.gpu ? std::format(L"CUDA antialiased bicubic on {}, streamed ({} streams, 2x{} MB pinned bands each)",
                                            gpu_description(), cfg.extract, kGpuBandBytes >> 20)
-                             : std::format(L"Intel IPP {} bicubic, {} dispatch{}", cpu.version, cpu.target,
+                             : std::format(L"Intel IPP {} antialiased bicubic, {} dispatch{}", cpu.version, cpu.target,
                                            cpu.avx512Active ? L" (AVX-512)" : L"");
     batch->backend += std::format(L"; {} extract / {} encode threads; mozjpeg q{}", cfg.extract, cfg.encode, cfg.quality);
     if (!gpuNote.empty())

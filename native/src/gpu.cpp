@@ -1,13 +1,7 @@
 #include "gpu.h"
 
-#include <nppcore.h>
-#include <nppi_geometry_transforms.h>
-
-#ifndef PP_NPP_DLL_SUFFIX
-#error "PP_NPP_DLL_SUFFIX must be defined (CUDA major version, e.g. 13)"
-#endif
-#define PP_WIDEN2(x) L##x
-#define PP_WIDEN(x) PP_WIDEN2(x)
+#include "gpu_resize_ptx.h"  // kResizePtx: native/src/gpu_resize.ptx, embedded by CMake
+#include "resize_filter.h"
 
 namespace pp {
 namespace {
@@ -18,53 +12,28 @@ struct GpuState {
     int device = 0;
     cudaDeviceProp prop{};
     cudaMemPool_t pool = nullptr;  // our own stream-ordered pool (null: device lacks pools -> cudaMalloc)
+    cudaLibrary_t library = nullptr;  // gpu_resize.ptx, JIT-compiled for this GPU by the driver
+    cudaKernel_t resize = nullptr;
 };
 GpuState g;
 
 std::wstring cuda_msg(cudaError_t e) { return widen(cudaGetErrorName(e)) + L": " + widen(cudaGetErrorString(e)); }
 
-// NPP is delay-loaded so psdpreview_native.dll loads on machines without CUDA. Load it
-// explicitly first (preferring our own directory) so a missing DLL is an error code
-// instead of a delay-load exception.
-bool load_npp(std::wstring& error) {
-    wchar_t self[MAX_PATH * 4] = {};
-    HMODULE hm = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&load_npp), &hm);
-    GetModuleFileNameW(hm, self, DWORD(std::size(self)));
-    std::wstring dir(self);
-    dir.resize(dir.find_last_of(L"\\/") + 1);
-
-    for (const wchar_t* name : {L"nppc64_" PP_WIDEN(PP_NPP_DLL_SUFFIX) L".dll", L"nppig64_" PP_WIDEN(PP_NPP_DLL_SUFFIX) L".dll"}) {
-        if (GetModuleHandleW(name)) continue;
-        if (LoadLibraryExW((dir + name).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) continue;
-        if (LoadLibraryW(name)) continue;
-        error = std::format(L"{} not found (put it next to psdpreview_native.dll): {}", name, win32_message(GetLastError()));
-        return false;
-    }
-    return true;
+// Loads the embedded kernel once; the driver JIT-compiles the PTX for the device (and caches it).
+cudaError_t load_kernels() {
+    if (g.resize) return cudaSuccess;
+    cudaError_t e = cudaLibraryLoadData(&g.library, kResizePtx, nullptr, nullptr, 0, nullptr, nullptr, 0);
+    if (e == cudaSuccess) e = cudaLibraryGetKernel(&g.resize, g.library, "pp_resize_cubic");
+    return e;
 }
 
-NppStreamContext make_context(cudaStream_t stream) {
-    NppStreamContext c{};
-    c.hStream = stream;
-    c.nCudaDeviceId = g.device;
-    c.nMultiProcessorCount = g.prop.multiProcessorCount;
-    c.nMaxThreadsPerMultiProcessor = g.prop.maxThreadsPerMultiProcessor;
-    c.nMaxThreadsPerBlock = g.prop.maxThreadsPerBlock;
-    c.nSharedMemPerBlock = g.prop.sharedMemPerBlock;
-    c.nCudaDevAttrComputeCapabilityMajor = g.prop.major;
-    c.nCudaDevAttrComputeCapabilityMinor = g.prop.minor;
-    cudaStreamGetFlags(stream, &c.nStreamFlags);
-    return c;
-}
-
-// RGBA8888 bicubic. (nppiResize maps pixels slightly differently from IPP; visually identical.)
-NppStatus npp_resize(const uint8_t* src, int srcStep, int w, int h, uint8_t* dst, int dstStep, int dw, int dh,
-                     const NppStreamContext& ctx) {
-    const NppiSize ss{w, h}, ds{dw, dh};
-    const NppiRect sr{0, 0, w, h}, dr{0, 0, dw, dh};
-    return nppiResize_8u_C4R_Ctx(src, srcStep, ss, sr, dst, dstStep, ds, dr, NPPI_INTER_CUBIC, ctx);
+// RGBA8888 (or CMYK) antialiased cubic resize on `s`, see gpu_resize.cu.
+cudaError_t gpu_resize(const uint8_t* src, size_t srcPitch, int w, int h, uint8_t* dst, size_t dstPitch, int dw, int dh,
+                       cudaStream_t s) {
+    CubicFilter f = resize_filter(w, dw);
+    void* args[] = {&src, &srcPitch, &w, &h, &dst, &dstPitch, &dw, &dh, &f.B, &f.C};
+    const dim3 block(32, 8), grid(unsigned(dw + 31) / 32, unsigned(dh + 7) / 8);
+    return cudaLaunchKernel(reinterpret_cast<const void*>(g.resize), grid, block, args, 0, s);
 }
 
 cudaError_t dev_alloc(uint8_t** p, size_t bytes, cudaStream_t s) {
@@ -85,8 +54,9 @@ void dev_free(uint8_t*& p, cudaStream_t s) {
     p = nullptr;
 }
 
-// Runs one small resize: proves NPP kernels load on this GPU and warms them up.
-bool npp_self_test(std::wstring& error) {
+// Runs one small resize: proves the kernel loads and runs on this GPU (and warms it up). A flat
+// image has to come out unchanged.
+bool gpu_self_test(std::wstring& error) {
     const int w = 64, h = 64, dw = 37, dh = 37, px = kPixelBytes;
     uint8_t *dSrc = nullptr, *dDst = nullptr;
     cudaStream_t s = nullptr;
@@ -95,15 +65,13 @@ bool npp_self_test(std::wstring& error) {
     if (e == cudaSuccess) e = dev_alloc(&dSrc, w * h * px, s);
     if (e == cudaSuccess) e = dev_alloc(&dDst, dw * dh * px, s);
     if (e == cudaSuccess) e = cudaMemsetAsync(dSrc, 0x80, w * h * px, s);
-    if (e == cudaSuccess) {
-        NppStatus ns = npp_resize(dSrc, w * px, w, h, dDst, dw * px, dw, dh, make_context(s));
-        e = cudaStreamSynchronize(s);
-        if (ns < NPP_SUCCESS) error = std::format(L"NPP self-test resize failed (NppStatus {})", int(ns));
-        else if (e != cudaSuccess) error = L"NPP self-test: " + cuda_msg(e);
-        else ok = true;
-    } else {
-        error = L"NPP self-test setup: " + cuda_msg(e);
-    }
+    if (e == cudaSuccess) e = gpu_resize(dSrc, w * px, w, h, dDst, dw * px, dw, dh, s);
+    std::vector<uint8_t> out(dw * dh * px);
+    if (e == cudaSuccess) e = cudaMemcpyAsync(out.data(), dDst, out.size(), cudaMemcpyDeviceToHost, s);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+    if (e != cudaSuccess) error = L"GPU self-test resize: " + cuda_msg(e);
+    else if (std::any_of(out.begin(), out.end(), [](uint8_t v) { return v != 0x80; })) error = L"GPU self-test resize: wrong result";
+    else ok = true;
     if (s) {
         dev_free(dSrc, s);
         dev_free(dDst, s);
@@ -122,11 +90,6 @@ void fill_info(PP_DeviceInfo& out) {
     cudaMemGetInfo(&freeB, &totalB);
     out.freeMemory = freeB;
     out.totalMemory = totalB;
-    if (const NppLibraryVersion* v = nppGetLibVersion()) {
-        out.nppMajor = v->major;
-        out.nppMinor = v->minor;
-        out.nppBuild = v->build;
-    }
 }
 
 // A private pool (not the device default pool, which other code in the process may tune)
@@ -183,9 +146,9 @@ int gpu_init(int device, PP_DeviceInfo* info) {
     copy_str(out.name, widen(g.prop.name));
     if (!g.pool) create_pool(device);
 
+    if ((e = load_kernels()) != cudaSuccess) return fail(PP_ERR_KERNEL_UNAVAILABLE, L"loading the resize kernel: " + cuda_msg(e));
     std::wstring err;
-    if (!load_npp(err)) return fail(PP_ERR_NPP_UNAVAILABLE, err);
-    if (!npp_self_test(err)) return fail(PP_ERR_NPP_UNAVAILABLE, err);
+    if (!gpu_self_test(err)) return fail(PP_ERR_KERNEL_UNAVAILABLE, err);
     fill_info(out);
     g.ready = true;
     return PP_OK;
@@ -214,10 +177,7 @@ bool gpu_memory(uint64_t& freeBytes, uint64_t& totalBytes) {
     return true;
 }
 
-std::wstring gpu_description() {
-    const NppLibraryVersion* v = g.ready ? nppGetLibVersion() : nullptr;
-    return v ? std::format(L"{} (NPP {}.{}.{})", widen(g.prop.name), v->major, v->minor, v->build) : widen(g.prop.name);
-}
+std::wstring gpu_description() { return widen(g.prop.name); }
 
 // ---- GpuStreamer ------------------------------------------------------------------------------
 
@@ -241,7 +201,6 @@ bool GpuStreamer::init(std::wstring& error) {
         if (e == cudaSuccess) e = cudaHostAlloc(reinterpret_cast<void**>(&band_[i]), kGpuBandBytes, cudaHostAllocDefault);
     }
     if (e != cudaSuccess) { error = L"GPU stream setup: " + cuda_msg(e); return false; }
-    ctx_ = make_context(stream_);
     return true;
 }
 
@@ -289,13 +248,7 @@ bool GpuStreamer::finish(int dw, int dh, uint8_t* dst, std::wstring& error) {
     const size_t dstRow = size_t(dw) * kPixelBytes, dstPitch = gpu_pitch(dstRow);
     cudaError_t e = err_;
     if (e == cudaSuccess) e = dev_alloc(&dDst, dstPitch * dh, stream_);
-    if (e == cudaSuccess) {
-        const NppStatus ns = npp_resize(dSrc_, int(pitch_), int(w_), int(h_), dDst, int(dstPitch), dw, dh, ctx_);
-        if (ns < NPP_SUCCESS) {
-            error = std::format(L"NPP resize failed (NppStatus {})", int(ns));
-            e = cudaErrorUnknown;
-        }
-    }
+    if (e == cudaSuccess) e = gpu_resize(dSrc_, pitch_, int(w_), int(h_), dDst, dstPitch, dw, dh, stream_);
     dev_free(dSrc_, stream_);
     // Pull straight into the caller's (pageable) buffer; returns once the copy is done.
     if (e == cudaSuccess) e = cudaMemcpy2DAsync(dst, dstRow, dDst, dstPitch, dstRow, dh, cudaMemcpyDeviceToHost, stream_);

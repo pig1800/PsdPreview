@@ -1,6 +1,5 @@
 #pragma once
 #include <cuda_runtime_api.h>
-#include <nppdefs.h>
 
 #include "common.h"
 #include "psd.h"
@@ -11,7 +10,7 @@ int gpu_init(int device, PP_DeviceInfo* info);
 bool gpu_ready();
 void gpu_shutdown();
 bool gpu_memory(uint64_t& freeBytes, uint64_t& totalBytes);
-std::wstring gpu_description();  // "NVIDIA ... (NPP 13.0.1)"
+std::wstring gpu_description();  // device name
 void gpu_trim();                 // returns pooled device memory after a batch
 
 // Device row pitch used for a packed row of `rowBytes`.
@@ -23,7 +22,7 @@ constexpr size_t kGpuBandBytes = 4u << 20;
 // One per extract thread: its own CUDA stream and two pinned band buffers.
 //   push    the decoder writes rows straight into the current pinned band (row()); a full
 //           band is uploaded asynchronously while the next one is decoded into the other
-//   process as soon as the last band is queued, NPP resizes on the same stream
+//   process as soon as the last band is queued, the resize kernel (gpu_resize.cu) runs on the same stream
 //   pull    the result is downloaded into the caller's buffer
 // Device memory comes from a stream-ordered pool, so concurrent images on other threads'
 // streams overlap freely and nothing is reallocated per image.
@@ -46,7 +45,6 @@ private:
     cudaStream_t stream_ = nullptr;
     cudaEvent_t uploaded_[2] = {};
     uint8_t* band_[2] = {};
-    NppStreamContext ctx_{};
     uint8_t* dSrc_ = nullptr;
     size_t pitch_ = 0, rowBytes_ = 0;
     uint32_t w_ = 0, h_ = 0, bandRows_ = 0, bandY0_ = 0;

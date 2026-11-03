@@ -1,7 +1,8 @@
 # PsdPreview
 
 Extracts the flattened full-resolution composite stored in PSD/PSB files, resizes it to a
-target width (bicubic — CUDA NPP when available, Intel IPP with AVX-512 otherwise), converts
+target width (antialiased bicubic fitted to Photoshop's *Bicubic Sharper* — on CUDA when
+available, Intel IPP with AVX-512 otherwise), converts
 embedded colour profiles to sRGB (Little CMS 2), and encodes JPEG with mozjpeg (q82).
 Native C++ DLL with a C# (.NET 8) wrapper.
 
@@ -22,17 +23,22 @@ static libs from NuGet, builds mozjpeg 4.1.5, fetches Little CMS 2.20 source int
 Requirements: Git, VS 2026 C++ tools, CMake ≥ 3.24, NASM, CUDA Toolkit 13 (headers/libs only —
 no nvcc needed), .NET 8 SDK.
 
+The CUDA kernel (`native\src\gpu_resize.cu`) is checked in compiled, as `gpu_resize.ptx`, which
+CMake embeds into the DLL. After editing the kernel, run `scripts\build-ptx.cmd`: it needs nvcc
+and VS 2019 or 2022 C++ tools (e.g. VS 2019 Build Tools) as nvcc's host compiler, because
+CUDA 13.0 can't use VS 2026's (its STL requires CUDA 13.2+).
+
 ## Deployment
 
-`psdpreview_native.dll` is standalone: IPP, mozjpeg, lcms2, psd_sdk and cudart are linked
+`psdpreview_native.dll` is the only file: IPP, mozjpeg, lcms2, psd_sdk and cudart are linked
 statically against the static CRT (`/MT`), so it imports only Windows system DLLs (`KERNEL32`,
-the `api-ms-win-core-synch` API set) — no VC++ redistributable. The only other files are the
-two CUDA NPP DLLs, `nppc64_13.dll` and `nppig64_13.dll`: NVIDIA ships static NPP
-(`libnpp*_static`) for Linux only; on Windows the toolkit has just DLL import stubs. They are delay-loaded, so without them, or without an NVIDIA driver/GPU, everything
-still works on the CPU path — drop them for a CPU-only distribution.
+the `api-ms-win-core-synch` API set) — no VC++ redistributable, no CUDA DLLs. The GPU resize is
+our own kernel, shipped as PTX that the driver JIT-compiles for the installed GPU on first use
+(Turing / sm_75 or newer, driver for CUDA 13+). Without an NVIDIA driver or GPU, everything
+works on the CPU path.
 
-Referencing `managed\PsdPreview\PsdPreview.csproj` copies `psdpreview_native.dll` and the NPP
-DLLs to the app's output. For a **single-file** app:
+Referencing `managed\PsdPreview\PsdPreview.csproj` copies `psdpreview_native.dll` to the app's
+output. For a **single-file** app:
 
 ```
 dotnet publish <YourApp> -c Release -r win-x64 --self-contained ^
@@ -40,10 +46,10 @@ dotnet publish <YourApp> -c Release -r win-x64 --self-contained ^
     -p:EnableCompressionInSingleFile=true
 ```
 
-The native DLLs are bundled into the exe and extracted on first run to
-`%TEMP%\.net\<app>\<hash>\` (override with `DOTNET_BUNDLE_EXTRACT_BASE_DIR`); the library finds
-NPP next to itself there. The demo published this way is one 60 MB exe (95 MB uncompressed,
-~25 MB of it NPP) that runs from an otherwise empty folder on both the GPU and CPU paths.
+The native DLL is bundled into the exe and extracted on first run to
+`%TEMP%\.net\<app>\<hash>\` (override with `DOTNET_BUNDLE_EXTRACT_BASE_DIR`). The demo
+published this way is one 36 MB exe (70 MB uncompressed) that runs from an otherwise empty
+folder on both the GPU and CPU paths.
 
 ## C# usage
 
@@ -123,18 +129,19 @@ each image as soon as it is resized:
    colour channel's bytes, PackBits-decode row by row (psd_sdk's `DecompressRle`), reduce >8-bit
    samples, and merge the planes into 4-byte pixels with SIMD: RGBA8888 (A = 255; gray expanded)
    or CMYK. Also reads the ICC profile and looks up its transform.
-2. **Resize** to the target width (height keeps aspect ratio), bicubic, 4 channels:
+2. **Resize** to the target width (height keeps aspect ratio), 4 channels, with the filter
+   described [below](#resize-filter):
    - GPU — streamed push/process/pull per extract thread: each thread has its own non-blocking
      CUDA stream and two 4 MB pinned band buffers. The decoder writes rows straight into the
      current band; a full band is uploaded asynchronously (`cudaMemcpy2DAsync` + event) while the
-     next band is decoded into the other buffer. As soon as the last band is queued,
-     `nppiResize_8u_C4R` runs on the same stream and the result is downloaded into the encoder's
-     buffer. The full-size image only ever exists in VRAM, allocated from a private
+     next band is decoded into the other buffer. As soon as the last band is queued, the resize
+     kernel (`gpu_resize.cu`) runs on the same stream and the result is downloaded into the
+     encoder's buffer. The full-size image only ever exists in VRAM, allocated from a private
      stream-ordered pool (`cudaMallocFromPoolAsync`), so the 16 streams' uploads and kernels
      overlap with no host staging copies and no dispatcher thread. An image the GPU can't take
      (e.g. VRAM exhausted) is redone on the CPU path.
    - CPU: decode into a per-thread buffer that is reused across files, then
-     `ippiResizeCubic_8u_C4R` (Catmull-Rom).
+     `ippiResizeAntialiasing_8u_C4R` (`ippiResizeCubic_8u_C4R` when enlarging).
 3. **Encode** (N threads): ICC → sRGB if needed, then mozjpeg reads the buffer as
    `JCS_EXT_RGBX` with its default max-compression profile (progressive, trellis, optimised
    Huffman, 4:2:0) at q82. Resized buffers are recycled through a small pool.
@@ -146,8 +153,42 @@ same configuration.
 Progress counts 3 steps per file (extract, resize, encode); failed files have their remaining
 steps added immediately, so progress always reaches 1.
 
-NPP and IPP outputs are not pixel-identical (NPP maps pixel coordinates slightly differently)
-but are visually the same.
+### Resize filter
+
+Shrinking uses a Mitchell–Netravali cubic, B = 0.3 and C = 2.2, whose support is widened by the
+reduction factor (antialiased: every source pixel contributes). Pixel centres map as
+`(i + 0.5) · src/dst − 0.5`, border pixels are replicated, and the weights are normalised. The
+parameters were fitted to Photoshop's *Bicubic Sharper (reduction)*. Enlarging uses Catmull-Rom
+(B = 0, C = 0.5), which interpolates, so a same-size resize changes nothing. `resize_filter.h`
+holds the parameters for both backends:
+
+- GPU: `gpu_resize.cu`, one thread per output pixel, computing both 1-D weight sets on the fly
+  (no tables, no intermediate image, so no VRAM beyond the source and result).
+- CPU: IPP's `ippiResizeAntialiasing` with the same cubic.
+
+The two backends agree to within rounding (luma PSNR 70 dB between their JPEGs).
+
+On a 1280 × 19500 webtoon page reduced to 450 px wide, luma PSNR against Photoshop's lossless
+*Bicubic Sharper* output (JPEG chroma subsampling puts every JPEG's RGB PSNR near 37 dB, so luma
+is the fair measure):
+
+| | luma PSNR |
+|---|---|
+| this filter, unencoded | 47.8 dB |
+| this filter, our JPEG at q100 (GPU and CPU alike) | 46.7 dB |
+| Photoshop's own JPEG export of its result | 40.8 dB |
+| antialiased Lanczos-3 | 38.8 dB |
+| antialiased Catmull-Rom (B = 0, C = 0.5) | 36.5 dB |
+| before: IPP cubic without antialiasing, JPEG q100 | 30.6 dB |
+| before: NPP cubic, JPEG q100 (also offset by a fraction of a pixel) | 24.8 dB |
+
+A cubic without antialiasing reads only a 4 × 4 neighbourhood whatever the scale, so at a 2–4×
+reduction most source pixels are skipped. That causes aliasing: moiré, thin lines broken into
+dots, and text strokes of uneven thickness. Photoshop's kernel is sharper than any common cubic.
+B and C came from a grid search on that page, ending in a ridge of near-equal fits. A free-form
+least-squares fit of Photoshop's 1-D kernel is ≈ 0.97 at 0, crosses zero at ±1.1 output pixels
+and dips to −0.27 at ±1.5; this cubic has the same −0.27 dip. A cubic additionally stretched by
+1.07 would gain 0.6 dB, but IPP can't stretch its kernels, so both backends share the plain one.
 
 ### SIMD (plane merge, 16 → 8-bit)
 
@@ -214,13 +255,14 @@ profile (ImageMagick can't write 32-bit PSDs, and its grayscale + ICC PSDs are m
 
 200 real webtoon pages (1280 px wide, 26 GB of PSDs), warm file cache, two runs each:
 
-| target width | CPU (IPP) | GPU (NPP, streamed) |
+| target width | CPU (IPP) | GPU (CUDA, streamed) |
 |---|---|---|
-| 720 px | 13.3–13.4 s, peak RAM 4.9 GB | 12.9–14.0 s, peak RAM 2.8 GB |
-| 360 px | 6.1–6.3 s | 5.8 s |
+| 720 px | 13.5–13.7 s, peak RAM 4.9 GB | 13.4–13.5 s, peak RAM 2.8 GB |
+| 360 px | 5.7–5.9 s | 5.2–5.3 s |
 
 Both paths are bound by the mozjpeg max-compression encode: the 16 encoders are busy for the
 whole run (~200 thread-s at 720 px) while extract threads mostly wait for them, and resizing
-is only ~9 thread-s on the CPU (~1 on the GPU). The GPU path's gain is therefore the resize time
-plus less memory traffic and ~40% less RAM; going substantially faster would need cheaper JPEG
-settings (e.g. without trellis quantisation / scan optimisation).
+is only ~15 thread-s on the CPU (~2 on the GPU). The antialiased filter costs about 1.7× the old
+non-antialiased cubic, which doesn't change the wall time. The GPU path's gain is therefore the
+resize time plus less memory traffic and ~40% less RAM; going substantially faster would need
+cheaper JPEG settings (e.g. without trellis quantisation / scan optimisation).

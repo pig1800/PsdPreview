@@ -4,7 +4,8 @@ namespace PsdPreview;
 
 /// <summary>
 /// Extracts the flattened composite of PSD/PSB files, resizes it to a target width
-/// (bicubic; CUDA NPP when initialised, Intel IPP otherwise) and encodes JPEG (mozjpeg).
+/// (antialiased bicubic matching Photoshop's "Bicubic Sharper"; CUDA when initialised, Intel IPP
+/// otherwise) and encodes JPEG (mozjpeg).
 /// </summary>
 /// <remarks>
 /// Typical use:
@@ -20,7 +21,7 @@ namespace PsdPreview;
 public static unsafe class PsdPreviewer
 {
     /// <summary>
-    /// Initialises CUDA + NPP on the given device. Call once when the program starts.
+    /// Initialises CUDA and the resize kernel on the given device. Call once when the program starts.
     /// On failure the library keeps working on the CPU (IPP) path; the result says why.
     /// </summary>
     public static CudaInitResult InitializeCuda(int deviceId = 0)
@@ -35,7 +36,6 @@ public static unsafe class PsdPreviewer
             new Version(info.ComputeMajor, info.ComputeMinor),
             (long)info.TotalMemory,
             (long)info.FreeMemory,
-            new Version(info.NppMajor, info.NppMinor, info.NppBuild),
             info.CudaRuntimeVersion,
             info.CudaDriverVersion);
     }

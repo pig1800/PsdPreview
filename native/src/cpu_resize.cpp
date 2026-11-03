@@ -2,6 +2,8 @@
 
 #include <ipp.h>
 
+#include "resize_filter.h"
+
 namespace pp {
 namespace {
 
@@ -43,15 +45,18 @@ const CpuBackend& cpu_backend() {
 bool cpu_resize(const uint8_t* src, int w, int h, uint8_t* dst, int dw, int dh, std::wstring& error) {
     cpu_backend();
     const IppiSize srcSize{w, h}, dstSize{dw, dh};
+    const CubicFilter f = resize_filter(w, dw);
+    const bool shrink = dw < w;  // antialiasing widens the kernel by the reduction factor
     int specSize = 0, initSize = 0, bufSize = 0;
-    IppStatus st = ippiResizeGetSize_8u(srcSize, dstSize, ippCubic, 0, &specSize, &initSize);
+    IppStatus st = ippiResizeGetSize_8u(srcSize, dstSize, ippCubic, shrink ? 1 : 0, &specSize, &initSize);
     if (st < ippStsNoErr) { error = widen(ippGetStatusString(st)); return false; }
 
     struct IppFree { void operator()(Ipp8u* p) const { ippsFree(p); } };
     std::unique_ptr<Ipp8u, IppFree> spec(ippsMalloc_8u(specSize)), init(ippsMalloc_8u(initSize));
     if (!spec || !init) { error = L"IPP out of memory"; return false; }
     auto* pSpec = reinterpret_cast<IppiResizeSpec_32f*>(spec.get());
-    st = ippiResizeCubicInit_8u(srcSize, dstSize, 0.0f, 0.5f, pSpec, init.get());
+    st = shrink ? ippiResizeAntialiasingCubicInit(srcSize, dstSize, f.B, f.C, pSpec, init.get())
+                : ippiResizeCubicInit_8u(srcSize, dstSize, f.B, f.C, pSpec, init.get());
     if (st < ippStsNoErr) { error = widen(ippGetStatusString(st)); return false; }
     init.reset();
 
@@ -61,8 +66,10 @@ bool cpu_resize(const uint8_t* src, int w, int h, uint8_t* dst, int dw, int dh, 
     if (!buffer) { error = L"IPP out of memory"; return false; }
 
     const IppiPoint origin{0, 0};
-    st = ippiResizeCubic_8u_C4R(src, w * kPixelBytes, dst, dw * kPixelBytes, origin, dstSize, ippBorderRepl, nullptr,
-                                pSpec, buffer.get());
+    st = shrink ? ippiResizeAntialiasing_8u_C4R(src, w * kPixelBytes, dst, dw * kPixelBytes, origin, dstSize, ippBorderRepl,
+                                                nullptr, pSpec, buffer.get())
+                : ippiResizeCubic_8u_C4R(src, w * kPixelBytes, dst, dw * kPixelBytes, origin, dstSize, ippBorderRepl, nullptr,
+                                         pSpec, buffer.get());
     if (st < ippStsNoErr) { error = widen(ippGetStatusString(st)); return false; }
     return true;
 }

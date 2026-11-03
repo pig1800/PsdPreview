@@ -14,7 +14,8 @@ struct CpuBackend {
 // used when the CPU/OS support it. Must run before any other IPP call.
 const CpuBackend& cpu_backend();
 
-// Bicubic (Catmull-Rom, B=0 C=0.5) resize of RGBA8888 pixels.
+// Cubic resize of 4-channel 8-bit pixels with the filter of resize_filter.h (antialiased when
+// shrinking), same as the GPU kernel.
 bool cpu_resize(const uint8_t* src, int w, int h, uint8_t* dst, int dw, int dh, std::wstring& error);
 
 }  // namespace pp

@@ -16,9 +16,6 @@ internal unsafe struct NativeDeviceInfo
     public int MultiProcessors;
     public int CudaRuntimeVersion;
     public int CudaDriverVersion;
-    public int NppMajor;
-    public int NppMinor;
-    public int NppBuild;
     public fixed char Name[256];
     public fixed char Message[Native.MessageCap];
 }

@@ -1,5 +1,6 @@
 // psdpreview — extract the flattened composite of PSD/PSB files, resize to a target
-// width (bicubic, CUDA/NPP or Intel IPP), and encode as JPEG with mozjpeg.
+// width (antialiased bicubic matching Photoshop's "Bicubic Sharper", CUDA or Intel IPP),
+// and encode as JPEG with mozjpeg.
 //
 // Plain C ABI so it can be P/Invoked from C#. All strings are UTF-16 (wchar_t).
 // Every struct is blittable; fixed-size message buffers avoid ownership questions.
@@ -26,7 +27,7 @@ typedef enum PP_Status {
     PP_ERR_INVALID_ARGUMENT = 1,
     PP_ERR_CUDA_UNAVAILABLE = 2, /* no driver / no CUDA device */
     PP_ERR_CUDA_FAILED = 3,      /* CUDA runtime error during initialisation */
-    PP_ERR_NPP_UNAVAILABLE = 4,  /* NPP DLLs missing or NPP self-test failed */
+    PP_ERR_KERNEL_UNAVAILABLE = 4, /* the resize kernel failed to load (driver too old?) or its self-test failed */
     PP_ERR_OUT_OF_MEMORY = 5,
     PP_ERR_INTERNAL = 6,
 } PP_Status;
@@ -60,9 +61,6 @@ typedef struct PP_DeviceInfo {
     int32_t multiProcessors;
     int32_t cudaRuntimeVersion; /* e.g. 13000 */
     int32_t cudaDriverVersion;
-    int32_t nppMajor;
-    int32_t nppMinor;
-    int32_t nppBuild;
     wchar_t name[256];
     wchar_t message[PP_MESSAGE_CAP]; /* failure reason when init fails */
 } PP_DeviceInfo;
@@ -136,8 +134,9 @@ typedef struct PP_Item {
 typedef struct PP_Batch PP_Batch;
 
 /* ---- CUDA ---------------------------------------------------------------
- * Call once at program start. Creates the CUDA context, loads NPP and runs a
- * tiny resize to warm up kernels. Safe to call again (no-op if initialised).
+ * Call once at program start. Creates the CUDA context, loads the resize kernel
+ * (JIT-compiled by the driver) and runs a tiny resize to check it. Safe to call
+ * again (no-op if initialised).
  * If it fails, processing silently uses the CPU (IPP) path. */
 PP_API int32_t pp_cuda_init(int32_t deviceId, PP_DeviceInfo* info);
 PP_API int32_t pp_cuda_ready(void);
