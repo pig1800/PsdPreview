@@ -1,5 +1,5 @@
 // CUDA kernels of the GPU path. Not compiled by the CMake build: scripts\build-ptx.cmd turns
-// this file into gpu_kernels.ptx (checked in), which CMake embeds and gpu.cpp JIT-loads with
+// this file into gpu_cuda.ptx (checked in), which CMake embeds and gpu_cuda.cpp JIT-loads with
 // cudaLibraryLoadData. Run the script after editing this file.
 //
 // The GPU path uploads the composite's colour channels still PackBits-compressed (~1.35 bytes
@@ -78,7 +78,7 @@ __device__ __forceinline__ float cubic6(float x, float B, float C) {
 
 __device__ __forceinline__ unsigned char to_u8(float v) { return (unsigned char)fminf(fmaxf(rintf(v), 0.f), 255.f); }
 
-constexpr int kTileW = 32, kTileH = 8;  // block = output tile; gpu.cpp launches 32 x 8 threads
+constexpr int kTileW = 32, kTileH = 8;  // block = output tile; gpu_cuda.cpp launches 32 x 8 threads
 constexpr int kChunk = 64;              // source rows per pass through shared memory (32 KB)
 
 // planes: NC planes of w x h bytes, `plane` bytes apart.

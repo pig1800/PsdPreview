@@ -38,7 +38,11 @@ static int g_failures = 0;
 
 static std::vector<simd::Level> levels() {
     std::vector<simd::Level> v;
+#if defined(_M_ARM64)
+    v.push_back(simd::Level::Neon);
+#else
     for (int l = 0; l <= int(simd::detected_level()); ++l) v.push_back(simd::Level(l));
+#endif
     return v;
 }
 

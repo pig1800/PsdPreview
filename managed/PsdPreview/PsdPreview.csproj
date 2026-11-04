@@ -5,23 +5,28 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <PlatformTarget>x64</PlatformTarget>
+    <!-- Architecture-neutral: Interop\Native.cs loads the native DLL matching the process. -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
     <RootNamespace>PsdPreview</RootNamespace>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
-    <!-- Built by scripts\build-native.cmd -->
-    <NativeBinDir>$(MSBuildThisFileDirectory)..\..\build\native\bin\</NativeBinDir>
+    <!-- Built by scripts\build-native.cmd (x64) and scripts\build-native.cmd arm64 -->
+    <NativeX64Dir>$(MSBuildThisFileDirectory)..\..\build\native\bin\</NativeX64Dir>
+    <NativeArm64Dir>$(MSBuildThisFileDirectory)..\..\build\native-arm64\bin\</NativeArm64Dir>
   </PropertyGroup>
 
-  <!-- psdpreview_native.dll (standalone); flows to referencing projects. -->
+  <!-- psdpreview_native.dll (standalone) per architecture, as x64\ and arm64\ next to the app;
+       flows to referencing projects. Whichever has been built. -->
   <ItemGroup>
-    <None Include="$(NativeBinDir)psdpreview_native.dll"
-          Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="$(NativeX64Dir)psdpreview_native.dll" Condition="Exists('$(NativeX64Dir)psdpreview_native.dll')"
+          Link="x64\psdpreview_native.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="$(NativeArm64Dir)psdpreview_native.dll" Condition="Exists('$(NativeArm64Dir)psdpreview_native.dll')"
+          Link="arm64\psdpreview_native.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 
   <Target Name="CheckNativeBuilt" BeforeTargets="Build">
-    <Error Condition="!Exists('$(NativeBinDir)psdpreview_native.dll')"
-           Text="psdpreview_native.dll not found in $(NativeBinDir). Run scripts\build-native.cmd first." />
+    <Error Condition="!Exists('$(NativeX64Dir)psdpreview_native.dll') And !Exists('$(NativeArm64Dir)psdpreview_native.dll')"
+           Text="psdpreview_native.dll not found. Run scripts\build-native.cmd (x64) and/or scripts\build-native.cmd arm64 first." />
   </Target>
 
 </Project>

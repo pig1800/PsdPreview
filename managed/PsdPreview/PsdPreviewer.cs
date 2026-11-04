@@ -4,13 +4,13 @@ namespace PsdPreview;
 
 /// <summary>
 /// Extracts the flattened composite of PSD/PSB files, resizes it to a target width
-/// (antialiased bicubic matching Photoshop's "Bicubic Sharper"; CUDA when initialised, Intel IPP
-/// otherwise) and encodes JPEG (mozjpeg).
+/// (antialiased bicubic matching Photoshop's "Bicubic Sharper"; on the GPU when initialised, with
+/// CUDA or D3D12 compute, otherwise on the CPU) and encodes JPEG (mozjpeg).
 /// </summary>
 /// <remarks>
 /// Typical use:
 /// <code>
-/// PsdPreviewer.InitializeCuda();                              // once, at startup
+/// PsdPreviewer.InitializeGpu();                               // once, at startup
 /// var problems = PsdPreviewer.ValidateFiles(files);          // show + stop if any
 /// var mem = PsdPreviewer.CheckMemory(files, 720);            // show mem.ToString() if !mem.IsEnough
 /// using var progress = new ProgressCounter();                // poll progress.Value from the UI
@@ -21,39 +21,49 @@ namespace PsdPreview;
 public static unsafe class PsdPreviewer
 {
     /// <summary>
-    /// Initialises CUDA and the resize kernel on the given device. Call once when the program starts.
-    /// On failure the library keeps working on the CPU (IPP) path; the result says why.
+    /// Initialises the GPU: creates the device, loads the kernels and self-tests them. Call once
+    /// when the program starts. <see cref="GpuBackend.Auto"/> takes CUDA on NVIDIA GPUs (x64), else
+    /// D3D12 compute on the fastest adapter. <paramref name="adapter"/> is the CUDA device, or the
+    /// D3D12 adapter index in DXGI's high-performance order. On failure the library keeps working
+    /// on the CPU path; the result says why.
     /// </summary>
-    public static CudaInitResult InitializeCuda(int deviceId = 0)
+    public static GpuInitResult InitializeGpu(GpuBackend backend = GpuBackend.Auto, int adapter = 0)
     {
         NativeDeviceInfo info;
-        var status = (PsdPreviewStatus)Native.pp_cuda_init(deviceId, &info);
-        return new CudaInitResult(
+        var status = (PsdPreviewStatus)Native.pp_gpu_init((int)backend, adapter, &info);
+        return new GpuInitResult(
             status,
             Native.Str(info.Message),
-            info.DeviceId,
+            (GpuBackend)info.Backend,
+            info.Adapter,
             Native.Str(info.Name),
             new Version(info.ComputeMajor, info.ComputeMinor),
+            info.WaveLanesMin,
+            info.WaveLanesMax,
+            info.Uma != 0,
+            info.CacheCoherentUma != 0,
+            info.DirectResult != 0,
+            info.Hybrid != 0,
             (long)info.TotalMemory,
             (long)info.FreeMemory,
             info.CudaRuntimeVersion,
             info.CudaDriverVersion);
     }
 
-    public static bool IsCudaReady => Native.pp_cuda_ready() != 0;
+    public static bool IsGpuReady => Native.pp_gpu_ready() != 0;
 
-    /// <summary>Stops using the GPU for subsequent batches (the CUDA context is left alone).</summary>
-    public static void ShutdownCuda() => Native.pp_cuda_shutdown();
+    /// <summary>Stops using the GPU for subsequent batches.</summary>
+    public static void ShutdownGpu() => Native.pp_gpu_shutdown();
 
-    /// <summary>IPP dispatch information (e.g. "k0" = AVX-512 code path).</summary>
+    /// <summary>CPU resizer and SIMD information (e.g. IPP target "k0" = AVX-512 code path).</summary>
     public static CpuBackendInfo GetCpuBackend()
     {
         NativeCpuInfo info;
         Check(Native.pp_cpu_info(&info), nameof(GetCpuBackend));
-        return new CpuBackendInfo(Native.Str(info.SimdLevel), Native.Str(info.IppTarget), Native.Str(info.IppName),
-                                  Native.Str(info.IppVersion),
+        return new CpuBackendInfo(Native.Str(info.SimdLevel), Native.Str(info.ResizeTarget), Native.Str(info.ResizeName),
+                                  Native.Str(info.ResizeVersion),
                                   info.Avx512Supported != 0, info.Avx512Active != 0, info.ForcedDispatch != 0,
-                                  info.LogicalCores);
+                                  info.LogicalCores, info.Arm64 != 0);
     }
 
     /// <summary>
@@ -143,7 +153,7 @@ public static unsafe class PsdPreviewer
             }
             var stats = new PsdPreviewStats(info.DecodeSeconds, info.ResizeSeconds, info.EncodeSeconds,
                                             info.ExtractWaitSeconds, info.EncodeIdleSeconds, info.ExtractThreads,
-                                            info.EncodeThreads, info.GpuFallbacks);
+                                            info.EncodeThreads, info.GpuFallbacks, info.GpuStreamers);
             return new PsdPreviewBatch(images, Native.Str(info.Backend), info.UsedGpu != 0,
                                        TimeSpan.FromSeconds(info.ElapsedSeconds), stats);
         }

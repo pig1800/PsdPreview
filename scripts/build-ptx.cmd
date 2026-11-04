@@ -1,5 +1,5 @@
 @echo off
-rem Regenerates native\src\gpu_kernels.ptx from native\src\gpu_kernels.cu (run after editing the
+rem Regenerates native\src\gpu_cuda.ptx from native\src\gpu_cuda.cu (run after editing the
 rem kernels; the normal build only embeds the checked-in .ptx and needs no nvcc).
 rem
 rem compute_75 PTX is JIT-compiled by the driver for whatever GPU it runs on (Turing and newer,
@@ -15,5 +15,5 @@ if not defined VSHOST (echo No VS 2019/2022 C++ tools found for nvcc's host comp
 rem vcvars64 chokes on some inherited PATH entries; start from a minimal PATH.
 set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\WindowsPowerShell\v1.0;%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
 call "%VSHOST%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
-"%CUDA_PATH%\bin\nvcc.exe" -ptx -arch=compute_75 -O3 -o "%ROOT%\native\src\gpu_kernels.ptx" "%ROOT%\native\src\gpu_kernels.cu" || exit /b 1
-echo Wrote native\src\gpu_kernels.ptx
+"%CUDA_PATH%\bin\nvcc.exe" -ptx -arch=compute_75 -O3 -o "%ROOT%\native\src\gpu_cuda.ptx" "%ROOT%\native\src\gpu_cuda.cu" || exit /b 1
+echo Wrote native\src\gpu_cuda.ptx

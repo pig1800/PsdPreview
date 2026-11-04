@@ -1,11 +1,13 @@
 // Demo / smoke test:
-//   PsdPreview.Demo <dir-or-file>... [--width 720] [--cpu] [--out DIR] [--limit N] [--quality 82] [--max-compression] [--extract N] [--encode N] [--validate-only] [--skip-validate]
+//   PsdPreview.Demo <dir-or-file>... [--width 720] [--gpu auto|cuda|d3d12|warp] [--adapter N] [--cpu] [--out DIR] [--limit N]
+//                   [--quality 82] [--max-compression] [--extract N] [--encode N] [--validate-only] [--skip-validate]
 using System.Diagnostics;
 using PsdPreview;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 var inputs = new List<string>();
-int width = 720, limit = int.MaxValue, quality = 82, extract = 0, encode = 0;
+int width = 720, limit = int.MaxValue, quality = 82, extract = 0, encode = 0, adapter = 0;
+var gpuBackend = GpuBackend.Auto;
 bool forceCpu = false, validateOnly = false, skipValidate = false, maxCompression = false;
 string? outDir = null;
 for (int i = 0; i < args.Length; i++)
@@ -17,6 +19,16 @@ for (int i = 0; i < args.Length; i++)
         case "--quality": quality = int.Parse(args[++i]); break;
         case "--out": outDir = args[++i]; break;
         case "--cpu": forceCpu = true; break;
+        case "--gpu":
+            gpuBackend = args[++i].ToLowerInvariant() switch
+            {
+                "cuda" => GpuBackend.Cuda,
+                "d3d12" => GpuBackend.D3D12,
+                "warp" => GpuBackend.D3D12Warp,
+                _ => GpuBackend.Auto,
+            };
+            break;
+        case "--adapter": adapter = int.Parse(args[++i]); break;
         case "--max-compression": maxCompression = true; break;
         case "--extract": extract = int.Parse(args[++i]); break;
         case "--encode": encode = int.Parse(args[++i]); break;
@@ -27,7 +39,8 @@ for (int i = 0; i < args.Length; i++)
 }
 if (inputs.Count == 0)
 {
-    Console.WriteLine("usage: PsdPreview.Demo <dir-or-file>... [--width N] [--cpu] [--out DIR] [--limit N] [--quality Q] [--max-compression] [--validate-only]");
+    Console.WriteLine("usage: PsdPreview.Demo <dir-or-file>... [--width N] [--gpu auto|cuda|d3d12|warp] [--adapter N] [--cpu] [--out DIR] " +
+                      "[--limit N] [--quality Q] [--max-compression] [--extract N] [--encode N] [--validate-only] [--skip-validate]");
     return 1;
 }
 
@@ -39,15 +52,16 @@ var files = inputs.SelectMany<string, string>(p => Directory.Exists(p)
     .Take(limit).ToList();
 
 var sw = Stopwatch.StartNew();
-var cuda = PsdPreviewer.InitializeCuda();
-Console.WriteLine(cuda.Success
-    ? $"CUDA: {cuda.DeviceName} sm_{cuda.ComputeCapability.Major}{cuda.ComputeCapability.Minor}, " +
-      $"{cuda.FreeMemoryBytes / 1048576} MiB free  (init {sw.ElapsedMilliseconds} ms)"
-    : $"CUDA unavailable ({cuda.Status}: {cuda.Message}) - using CPU");
+if (!forceCpu)
+{
+    var gpu = PsdPreviewer.InitializeGpu(gpuBackend, adapter);
+    Console.WriteLine($"GPU : {gpu}{(gpu.Success ? $"  (init {sw.ElapsedMilliseconds} ms)" : " - using CPU")}");
+}
 var cpu = PsdPreviewer.GetCpuBackend();
-Console.WriteLine($"SIMD: {cpu.SimdLevel} (plane merge / bit-depth reduction)");
-Console.WriteLine($"IPP : {cpu.IppName} {cpu.IppVersion}, target {cpu.IppTarget}, AVX-512 supported={cpu.Avx512Supported} " +
-                  $"active={cpu.Avx512Active} forced={cpu.ForcedDispatch}, {cpu.LogicalCores} threads");
+Console.WriteLine($"SIMD: {cpu.SimdLevel} (plane merge / bit-depth reduction){(cpu.Arm64 ? ", ARM64" : "")}");
+Console.WriteLine($"CPU resize: {cpu.ResizeLibrary} {cpu.ResizeVersion}, target {cpu.ResizeTarget}" +
+                  (cpu.Arm64 ? "" : $", AVX-512 supported={cpu.Avx512Supported} active={cpu.Avx512Active} forced={cpu.ForcedDispatch}") +
+                  $", {cpu.LogicalCores} threads");
 Console.WriteLine($"{files.Count} files");
 
 sw.Restart();

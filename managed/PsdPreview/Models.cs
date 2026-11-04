@@ -5,9 +5,11 @@ public enum PsdPreviewStatus
 {
     Ok = 0,
     InvalidArgument = 1,
-    CudaUnavailable = 2,
-    CudaFailed = 3,
-    /// <summary>The GPU resize kernel failed to load (e.g. driver older than CUDA 13) or its self-test failed.</summary>
+    /// <summary>No GPU driver, or no such device / adapter.</summary>
+    GpuUnavailable = 2,
+    /// <summary>CUDA or D3D12 error during initialisation.</summary>
+    GpuFailed = 3,
+    /// <summary>The GPU kernels failed to load (e.g. driver too old) or their self-test failed.</summary>
     KernelUnavailable = 4,
     OutOfMemory = 5,
     Internal = 6,
@@ -43,37 +45,86 @@ public sealed record PsdFileProblem(int Index, string Path, PsdProblemKind Kind,
     public override string ToString() => $"{FileName}: {Message}";
 }
 
-public sealed record CudaInitResult(
+/// <summary>GPU APIs.</summary>
+public enum GpuBackend
+{
+    /// <summary>CUDA if it works (NVIDIA, x64), else D3D12 on the high-performance adapter.</summary>
+    Auto = 0,
+    /// <summary>NVIDIA GPUs; x64 builds only.</summary>
+    Cuda = 1,
+    /// <summary>D3D12 compute: any GPU with a D3D12 driver (AMD, Intel, Qualcomm Adreno, NVIDIA).</summary>
+    D3D12 = 2,
+    /// <summary>D3D12 on WARP, the software rasterizer of Windows (testing).</summary>
+    D3D12Warp = 3,
+}
+
+/// <param name="Status">Ok, or why no GPU is used.</param>
+/// <param name="Message">Failure reason; with <see cref="GpuBackend.Auto"/> also why CUDA was skipped.</param>
+/// <param name="Backend">The API that was initialised.</param>
+/// <param name="Adapter">CUDA device / D3D12 adapter index (DXGI high-performance order).</param>
+/// <param name="DeviceName">GPU name.</param>
+/// <param name="ComputeCapability">CUDA compute capability, or D3D12 shader model (6.x).</param>
+/// <param name="WaveLanesMin">SIMD width: CUDA warp size, or the smallest D3D12 wave.</param>
+/// <param name="WaveLanesMax">The largest D3D12 wave.</param>
+/// <param name="IsUma">Integrated GPU sharing system memory: the compressed data is read straight into memory it reads (no copy).</param>
+/// <param name="IsCacheCoherentUma">UMA with CPU and GPU caches coherent. When false, memory the CPU writes for the GPU is
+/// write-combined (uncached; the library only ever writes it sequentially).</param>
+/// <param name="DirectResult">D3D12: the result is written straight into CPU-readable memory (else copied there by the GPU).</param>
+/// <param name="Hybrid">The path batches take: true (D3D12 on UMA) = the CPU decodes into memory the GPU reads, the GPU
+/// resizes into memory the encoder reads; false = the GPU unpacks and resizes (discrete GPUs, CUDA).</param>
+/// <param name="TotalMemoryBytes">VRAM; for D3D12 the OS budget for the GPU (system memory on UMA).</param>
+/// <param name="FreeMemoryBytes">What is left of it now.</param>
+/// <param name="CudaRuntimeVersion">CUDA runtime version (e.g. 13000); 0 for D3D12.</param>
+/// <param name="CudaDriverVersion">CUDA driver version; 0 for D3D12.</param>
+public sealed record GpuInitResult(
     PsdPreviewStatus Status,
     string Message,
-    int DeviceId,
+    GpuBackend Backend,
+    int Adapter,
     string DeviceName,
     Version ComputeCapability,
+    int WaveLanesMin,
+    int WaveLanesMax,
+    bool IsUma,
+    bool IsCacheCoherentUma,
+    bool DirectResult,
+    bool Hybrid,
     long TotalMemoryBytes,
     long FreeMemoryBytes,
     int CudaRuntimeVersion,
     int CudaDriverVersion)
 {
     public bool Success => Status == PsdPreviewStatus.Ok;
+
+    public override string ToString() => !Success
+        ? $"GPU unavailable ({Status}: {Message})"
+        : Backend == GpuBackend.Cuda
+            ? $"CUDA: {DeviceName} sm_{ComputeCapability.Major}{ComputeCapability.Minor}, {FreeMemoryBytes / 1048576} MiB free"
+            : $"D3D12: {DeviceName}, SM {ComputeCapability.Major}.{ComputeCapability.Minor}, waves {WaveLanesMin}-{WaveLanesMax}" +
+              $"{(IsUma ? IsCacheCoherentUma ? ", UMA" : ", UMA (not cache-coherent)" : "")}{(DirectResult ? ", direct result" : "")}" +
+              $"{(Hybrid ? ", hybrid: CPU decode + GPU resize" : ", GPU decode + resize")}, {FreeMemoryBytes / 1048576} MiB budget free" +
+              (Message.Length > 0 ? $" ({Message})" : "");
 }
 
-/// <param name="SimdLevel">Kernels used for plane merge / bit-depth reduction: "AVX-512", "AVX2" or "SSE2".</param>
-/// <param name="IppTarget">IPP dispatch target: "k0" = AVX-512, "l9" = AVX2.</param>
-/// <param name="IppName">IPP library name.</param>
-/// <param name="IppVersion">IPP version string.</param>
+/// <param name="SimdLevel">Kernels used for plane merge / bit-depth reduction: "AVX-512", "AVX2", "SSE2" or "NEON".</param>
+/// <param name="ResizeTarget">IPP dispatch target ("k0" = AVX-512, "l9" = AVX2), or stb_image_resize2's SIMD set.</param>
+/// <param name="ResizeLibrary">CPU resizer: the IPP library name, or "stb_image_resize2" (ARM64).</param>
+/// <param name="ResizeVersion">Its version.</param>
 /// <param name="Avx512Supported">CPU and OS support AVX-512 F/CD/BW/DQ/VL.</param>
 /// <param name="Avx512Active">IPP runs its AVX-512 code path.</param>
 /// <param name="ForcedDispatch">IPP's default dispatch had to be overridden to get AVX-512.</param>
 /// <param name="LogicalCores">Logical processors.</param>
+/// <param name="Arm64">The native library is the ARM64 build.</param>
 public sealed record CpuBackendInfo(
     string SimdLevel,
-    string IppTarget,
-    string IppName,
-    string IppVersion,
+    string ResizeTarget,
+    string ResizeLibrary,
+    string ResizeVersion,
     bool Avx512Supported,
     bool Avx512Active,
     bool ForcedDispatch,
-    int LogicalCores);
+    int LogicalCores,
+    bool Arm64);
 
 public sealed record MemoryCheckResult(
     long HostRequiredBytes,
@@ -102,7 +153,7 @@ public sealed record MemoryCheckResult(
 public sealed class PsdPreviewOptions
 {
     public int JpegQuality { get; init; } = 82;
-    /// <summary>Use IPP even when CUDA is initialised.</summary>
+    /// <summary>Use the CPU even when a GPU is initialised.</summary>
     public bool ForceCpu { get; init; }
     public int ExtractThreads { get; init; }
     public int EncodeThreads { get; init; }
@@ -128,10 +179,12 @@ public sealed record PsdPreviewStats(
     double EncodeIdleSeconds,
     int ExtractThreads,
     int EncodeThreads,
-    int GpuFallbacks)
+    int GpuFallbacks,
+    int GpuStreamers)
 {
     public override string ToString() =>
-        $"extract x{ExtractThreads}: decode {DecodeSeconds:0.0}s, resize {ResizeSeconds:0.0}s, waiting {ExtractWaitSeconds:0.0}s | " +
+        $"extract x{ExtractThreads}{(GpuStreamers > 0 ? $" ({GpuStreamers} GPU streamers)" : "")}: decode {DecodeSeconds:0.0}s, " +
+        $"resize {ResizeSeconds:0.0}s, waiting {ExtractWaitSeconds:0.0}s | " +
         $"encode x{EncodeThreads}: encode {EncodeSeconds:0.0}s, idle {EncodeIdleSeconds:0.0}s" +
         (GpuFallbacks > 0 ? $" | {GpuFallbacks} GPU fallback(s)" : "");
 }

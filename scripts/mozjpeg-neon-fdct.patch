@@ -1,0 +1,31 @@
+mozjpeg 4.1.5 (libjpeg-turbo 2.1) Neon forward DCT: with mozjpeg's overshoot deringing, samples reach
+255 + 31 and two sums in pass 2 overflow 16 bits (whole rows of a block come out inverted).
+Bit-exact with the C jpeg_fdct_islow afterwards (20M random/extreme blocks; 221 differed before).
+Applied by scripts\setup-deps.cmd arm64 (only ARM builds compile this file).
+
+--- simd/arm/jfdctint-neon.c
++++ simd/arm/jfdctint-neon.c
+@@ -274,12 +274,18 @@ void jsimd_fdct_islow_neon(DCTELEM *data)
+   tmp11 = vaddq_s16(tmp1, tmp2);
+   tmp12 = vsubq_s16(tmp1, tmp2);
+ 
+-  row0 = vrshrq_n_s16(vaddq_s16(tmp10, tmp11), PASS1_BITS);
+-  row4 = vrshrq_n_s16(vsubq_s16(tmp10, tmp11), PASS1_BITS);
++  /* mozjpeg's overshoot deringing raises samples past 255 (up to 255 + 31), and then
++   * tmp10 + tmp11 and tmp12 + tmp13 no longer fit in 16 bits: whole rows of a block came out
++   * inverted.  A halving add/sub followed by a rounding shift of PASS1_BITS - 1 is exactly
++   * DESCALE(tmp10 +/- tmp11, PASS1_BITS); (tmp12 + tmp13) * c is accumulated in 32 bits.
++   */
++  row0 = vrshrq_n_s16(vhaddq_s16(tmp10, tmp11), PASS1_BITS - 1);
++  row4 = vrshrq_n_s16(vhsubq_s16(tmp10, tmp11), PASS1_BITS - 1);
+ 
+-  tmp12_add_tmp13 = vaddq_s16(tmp12, tmp13);
+-  z1_l = vmull_lane_s16(vget_low_s16(tmp12_add_tmp13), consts.val[0], 2);
+-  z1_h = vmull_lane_s16(vget_high_s16(tmp12_add_tmp13), consts.val[0], 2);
++  z1_l = vmull_lane_s16(vget_low_s16(tmp12), consts.val[0], 2);
++  z1_h = vmull_lane_s16(vget_high_s16(tmp12), consts.val[0], 2);
++  z1_l = vmlal_lane_s16(z1_l, vget_low_s16(tmp13), consts.val[0], 2);
++  z1_h = vmlal_lane_s16(z1_h, vget_high_s16(tmp13), consts.val[0], 2);
+ 
+   int32x4_t row2_scaled_l =
+     vmlal_lane_s16(z1_l, vget_low_s16(tmp13), consts.val[0], 3);

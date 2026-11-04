@@ -10,10 +10,17 @@ internal unsafe struct NativeDeviceInfo
 {
     public ulong TotalMemory;
     public ulong FreeMemory;
-    public int DeviceId;
+    public int Backend;
+    public int Adapter;
     public int ComputeMajor;
     public int ComputeMinor;
     public int MultiProcessors;
+    public int WaveLanesMin;
+    public int WaveLanesMax;
+    public int Uma;
+    public int CacheCoherentUma;
+    public int DirectResult;
+    public int Hybrid;
     public int CudaRuntimeVersion;
     public int CudaDriverVersion;
     public fixed char Name[256];
@@ -27,10 +34,11 @@ internal unsafe struct NativeCpuInfo
     public int Avx512Supported;
     public int Avx512Active;
     public int ForcedDispatch;
-    public fixed char IppTarget[8];
-    public fixed char IppName[128];
-    public fixed char IppVersion[64];
+    public fixed char ResizeTarget[8];
+    public fixed char ResizeName[128];
+    public fixed char ResizeVersion[64];
     public fixed char SimdLevel[16];
+    public int Arm64;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -80,6 +88,7 @@ internal unsafe struct NativeBatchInfo
     public int GpuFallbacks;
     public int ExtractThreads;
     public int EncodeThreads;
+    public int GpuStreamers;
     public fixed char Backend[Native.MessageCap];
 }
 
@@ -102,9 +111,35 @@ internal static unsafe partial class Native
     internal const int MessageCap = 260;
     private const string Lib = "psdpreview_native";
 
-    [LibraryImport(Lib)] internal static partial int pp_cuda_init(int deviceId, NativeDeviceInfo* info);
-    [LibraryImport(Lib)] internal static partial int pp_cuda_ready();
-    [LibraryImport(Lib)] internal static partial void pp_cuda_shutdown();
+    // The native DLL is built per architecture and sits in x64\ or arm64\ next to the app (or,
+    // in a single-file app, where the bundle extracted its native libraries); load the one
+    // matching this process (an x64 app under emulation on ARM64 gets the x64 one).
+    // Falls back to the default search (e.g. the DLL right next to the app).
+    static Native()
+    {
+        NativeLibrary.SetDllImportResolver(typeof(Native).Assembly, (name, assembly, path) =>
+        {
+            if (name != Lib) return IntPtr.Zero;
+            string? arch = RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.X64 => "x64",
+                Architecture.Arm64 => "arm64",
+                _ => null,
+            };
+            if (arch == null) return IntPtr.Zero;
+            var dirs = new List<string> { AppContext.BaseDirectory };
+            if (AppContext.GetData("NATIVE_DLL_SEARCH_DIRECTORIES") is string extra)
+                dirs.AddRange(extra.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries));
+            foreach (var dir in dirs)
+                if (NativeLibrary.TryLoad(Path.Combine(dir, arch, Lib + ".dll"), out var handle))
+                    return handle;
+            return IntPtr.Zero;
+        });
+    }
+
+    [LibraryImport(Lib)] internal static partial int pp_gpu_init(int backend, int adapter, NativeDeviceInfo* info);
+    [LibraryImport(Lib)] internal static partial int pp_gpu_ready();
+    [LibraryImport(Lib)] internal static partial void pp_gpu_shutdown();
     [LibraryImport(Lib)] internal static partial int pp_cpu_info(NativeCpuInfo* info);
     [LibraryImport(Lib)] internal static partial int pp_validate(char** paths, int count, int targetWidth, NativeIssue* issues, int* issueCount);
     [LibraryImport(Lib)] internal static partial int pp_check_memory(char** paths, int count, int targetWidth, NativeOptions* options, NativeMemoryReport* report);

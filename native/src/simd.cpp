@@ -1,6 +1,8 @@
 #include "simd.h"
 
+#if !defined(_M_ARM64)
 #include <intrin.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +43,16 @@ void merge_4(const uint8_t* c0, const uint8_t* c1, const uint8_t* c2, const uint
 // ---- dispatch -------------------------------------------------------------------------------
 namespace {
 
+#if defined(_M_ARM64)
+
+const Kernels kNeon = {neon::narrow16, neon::merge_rgb, neon::merge_gray, neon::merge_4, Level::Neon, L"NEON"};
+
+Level detect() { return Level::Neon; }
+Level initial_level() { return Level::Neon; }
+const Kernels& table(Level) { return kNeon; }
+
+#else
+
 const Kernels kTable[] = {
     {sse2::narrow16, sse2::merge_rgb, sse2::merge_gray, sse2::merge_4, Level::Sse2, L"SSE2"},
     {avx2::narrow16, avx2::merge_rgb, avx2::merge_gray, avx2::merge_4, Level::Avx2, L"AVX2"},
@@ -65,6 +77,8 @@ Level detect() {
     return Level::Sse2;  // AVX1-only CPUs lack 256-bit integer ops: SSE2 kernels
 }
 
+const Kernels& table(Level level) { return kTable[int(level)]; }
+
 Level initial_level() {
     Level level = detected_level();
     char buf[16] = {};
@@ -79,6 +93,8 @@ Level initial_level() {
     return level;
 }
 
+#endif
+
 const Kernels* g_active = nullptr;
 
 }  // namespace
@@ -90,7 +106,7 @@ Level detected_level() {
 
 const Kernels& kernels_for(Level level) {
     if (int(level) > int(detected_level())) level = detected_level();
-    return kTable[int(level)];
+    return table(level);
 }
 
 const Kernels& kernels() {

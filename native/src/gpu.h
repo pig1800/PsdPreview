@@ -1,70 +1,87 @@
 #pragma once
-#include <cuda_runtime_api.h>
-
 #include "common.h"
 #include "psd.h"
 
 namespace pp {
 
-int gpu_init(int device, PP_DeviceInfo* info);
-bool gpu_ready();
-void gpu_shutdown();
-bool gpu_memory(uint64_t& freeBytes, uint64_t& totalBytes);
-std::wstring gpu_description();  // device name
-void gpu_trim();                 // returns pooled device memory after a batch
-
-// Device row pitch used for a packed row of `rowBytes`.
-inline uint64_t gpu_pitch(uint64_t rowBytes) { return (rowBytes + 255) & ~uint64_t(255); }
-
-// Pinned bytes per band buffer (each streamer has two).
+// Pinned (CUDA) / upload-heap (D3D12) bytes per band buffer; a streamer has two.
 constexpr size_t kGpuBandBytes = 4u << 20;
 
-// One per extract thread: its own CUDA stream and two pinned band buffers. The composite is
-// decoded on the GPU (see gpu_kernels.cu):
-//   push    upload() reads the colour channels' data straight from the file into the current
-//           pinned band, still PackBits-compressed (~1.35 bytes/px instead of 4 decoded, and no
-//           CPU work beyond the read); a full band is uploaded asynchronously while the next one
-//           is read into the other
-//   process finish() unpacks every row (one GPU thread per row) into 8-bit planes and resizes
-//   pull    the result is downloaded into the caller's buffer
-// Device memory comes from a stream-ordered pool, so concurrent images on other threads'
-// streams overlap freely and nothing is reallocated per image.
-class GpuStreamer final {
+// A resized image in memory the GPU wrote and the CPU reads in place (hybrid path, see below):
+// the encoder takes it as it is. Destroying it hands the memory back to the backend.
+class GpuImage {
 public:
-    GpuStreamer() = default;
-    GpuStreamer(const GpuStreamer&) = delete;
-    GpuStreamer& operator=(const GpuStreamer&) = delete;
-    ~GpuStreamer();
-
-    // RLE 8/16-bit and raw 8-bit composites; anything else goes the CPU path.
-    static bool supports(const PsdHeader& h);
-    // Device memory needed for one image (upper bound, from the header).
-    static uint64_t device_bytes(const PsdHeader& h, int dw, int dh);
-
-    bool init(std::wstring& error);  // once per thread
-    // Reads and uploads the composite. A file problem (truncated, blank...) is returned in
-    // `file`; false with `file` ok means a GPU problem (`error`): redo the image on the CPU.
-    bool upload(const FileReader& f, const PsdHeader& h, FileStatus& file, std::wstring& error);
-    // Unpacks, resizes and downloads into dst (dw x dh x 4 bytes). Corrupt PackBits data is a
-    // file problem (`file`); false with `file` ok is a GPU problem (`error`).
-    bool finish(int dw, int dh, uint8_t* dst, FileStatus& file, std::wstring& error);
-    void abort();  // drops the current image
-
-private:
-    cudaError_t send(uint8_t* devDst, size_t n);  // uploads band_[cur_], switches bands
-
-    cudaStream_t stream_ = nullptr;
-    cudaEvent_t uploaded_[2] = {};  // per band; blocking-sync events: waiting threads sleep
-    uint8_t* band_[2] = {};
-    uint32_t* status_ = nullptr;  // pinned: first corrupt row reported by the unpack kernel
-    int cur_ = 0;
-
-    // the current image
-    uint8_t *dComp_ = nullptr, *dPlanes_ = nullptr;
-    uint32_t* dOffsets_ = nullptr;  // rows + 1 offsets into dComp_
-    uint32_t* dBad_ = nullptr;
-    uint32_t w_ = 0, h_ = 0;
-    int planes_ = 0, depth_ = 8, compression_ = 0;
+    virtual ~GpuImage() = default;
+    uint8_t* data = nullptr;  // dw x dh x 4 bytes
 };
+
+// Takes one image at a time through the GPU, push -> process -> pull:
+//   upload  reads the composite's colour channels from the file to the GPU, still
+//           PackBits-compressed for RLE (~1.35 bytes/px for webtoon pages instead of 4 decoded,
+//           and no CPU work beyond the read)
+//   finish  unpacks the rows into 8-bit planes on the GPU, resizes them with the filter of
+//           resize_filter.h and brings the result back into the caller's buffer
+// Used by one thread at a time (the engine shares a pool of them between its extract threads).
+class GpuStreamer {
+public:
+    virtual ~GpuStreamer() = default;
+    // A file problem (truncated, blank...) is returned in `file`; false with `file` ok means a
+    // GPU problem (`error`): redo the image on the CPU.
+    virtual bool upload(const FileReader& f, const PsdHeader& h, FileStatus& file, std::wstring& error) = 0;
+    // dst: dw x dh x 4 bytes. Corrupt PackBits data is a file problem (`file`); false with `file`
+    // ok is a GPU problem (`error`).
+    virtual bool finish(int dw, int dh, uint8_t* dst, FileStatus& file, std::wstring& error) = 0;
+    virtual void abort() = 0;  // drops the current image
+
+    // Hybrid path (integrated GPUs, GpuBackend::hybrid): the CPU decodes the composite into
+    // decode_target() - memory the GPU reads, so nothing is copied - and resize_decoded() resizes
+    // it on the GPU into a GpuImage the encoder reads where the GPU wrote it.
+    virtual RowSink* decode_target(const PsdHeader&, std::wstring& error) {
+        error = L"no hybrid path";
+        return nullptr;
+    }
+    virtual std::unique_ptr<GpuImage> resize_decoded(int, int, std::wstring& error) {
+        error = L"no hybrid path";
+        return nullptr;
+    }
+};
+
+// An initialised GPU (gpu_init): CUDA (gpu_cuda.cpp, x64 builds) or D3D12 compute (gpu_d3d12.cpp).
+class GpuBackend {
+public:
+    virtual ~GpuBackend() = default;
+    // Formats the kernels take (RLE 8/16-bit, raw 8-bit); anything else goes the CPU way.
+    virtual bool supports(const PsdHeader& h) const = 0;
+    // GPU memory a streamer needs for this image (upper bound, from the header). On an integrated
+    // GPU (UMA) this is system memory.
+    virtual uint64_t device_bytes(const PsdHeader& h, int dw, int dh) const = 0;
+    virtual std::unique_ptr<GpuStreamer> make_streamer(std::wstring& error) = 0;
+    // Memory the GPU may still use (D3D12: the OS budget), and its total.
+    virtual bool memory(uint64_t& freeBytes, uint64_t& totalBytes) = 0;
+    virtual std::wstring description() const = 0;  // for the batch's backend string
+    virtual void trim() {}                          // returns cached memory after a batch
+    // PP_GPU_PROFILE=1: GPU time per image since the last call ("" when not profiling).
+    virtual std::wstring profile() { return {}; }
+    // Measured GPU time per source megapixel (kernels only, recent images weighted most), for the
+    // full GPU path or the hybrid one (resize only); 0 = not measured: treat the GPU as fast. The
+    // engine sends an image the CPU way when the GPU's backlog would keep it longer than the CPU
+    // takes.
+    virtual double seconds_per_mpx(bool /*hybrid*/) const { return 0; }
+    virtual bool integrated() const { return false; }  // shares the CPU's memory (UMA)
+    virtual bool hybrid() const { return false; }      // streamers do decode_target / resize_decoded
+};
+
+// backend: PP_GpuBackend; adapter: CUDA device ordinal, or D3D12 adapter index in DXGI's
+// high-performance order (software adapters left out). Replaces any earlier backend.
+int gpu_init(int backend, int adapter, PP_DeviceInfo* info);
+std::shared_ptr<GpuBackend> gpu_backend();  // null until gpu_init succeeds
+void gpu_shutdown();
+
+// Backend factories: create, load the kernels and run a self-test. On failure the code is
+// returned and info.message says why.
+#if PP_HAVE_CUDA
+int cuda_create(int device, PP_DeviceInfo& info, std::shared_ptr<GpuBackend>& out);
+#endif
+int d3d12_create(int adapter, bool warp, PP_DeviceInfo& info, std::shared_ptr<GpuBackend>& out);
 
 }  // namespace pp

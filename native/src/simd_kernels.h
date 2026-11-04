@@ -1,5 +1,5 @@
 // Kernel entry points, one namespace per instruction set. Each set lives in its own
-// translation unit compiled with the matching /arch flag. This header only declares
+// translation unit compiled with the matching /arch flag (x64), or simd_neon.cpp (ARM64). This header only declares
 // functions (no inline code), so nothing compiled for AVX2/AVX-512 can be picked up by
 // baseline code through inline-function merging.
 #pragma once
@@ -24,6 +24,7 @@ PP_DECLARE_SIMD_KERNELS(scalar)
 PP_DECLARE_SIMD_KERNELS(sse2)
 PP_DECLARE_SIMD_KERNELS(avx2)
 PP_DECLARE_SIMD_KERNELS(avx512)
+PP_DECLARE_SIMD_KERNELS(neon)
 }  // namespace pp::simd
 
 #undef PP_DECLARE_SIMD_KERNELS

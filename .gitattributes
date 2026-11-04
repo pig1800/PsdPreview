@@ -3,3 +3,5 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 *.sln text eol=crlf
+# git apply rejects a CRLF patch against the LF sources of a downloaded tarball
+*.patch text eol=lf

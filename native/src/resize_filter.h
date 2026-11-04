@@ -2,7 +2,8 @@
 
 namespace pp {
 
-// The one resampling filter of both backends (cpu_resize.cpp via IPP, gpu_kernels.cu on CUDA):
+// The one resampling filter of every backend (cpu_resize.cpp: IPP or stb_image_resize2; the GPU
+// kernels in gpu_cuda.cu and gpu_d3d12.hlsl):
 // a Mitchell-Netravali cubic, widened by the reduction factor when shrinking (antialiased),
 // pixel centres at (i + 0.5) * src / dst - 0.5, border pixels replicated.
 //   shrinking  B = 0.3, C = 2.2: fitted to Photoshop's "Bicubic Sharper (reduction)". On a
